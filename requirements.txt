@@ -1,0 +1,7 @@
+python-telegram-bot==21.5
+transformers>=4.40.0,<5
+torch>=2.2.0,<3
+sentence-transformers>=2.7.0,<6
+numpy>=1.26.0,<3
+PyPDF2>=3.0.1,<4
+python-dotenv>=1.0.0,<2
