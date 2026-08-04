@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from book_qa import BookKnowledgeBase
+from file_utils import normalize_book_filename
 
 load_dotenv()
 logging.basicConfig(
@@ -41,19 +42,21 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
     user_id = update.effective_user.id
-    
-    if not (document.file_name.endswith('.pdf') or document.file_name.endswith('.txt')):
-        await update.message.reply_text("Send PDF or TXT file only")
+
+    try:
+        filename = normalize_book_filename(document.file_name)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
         return
-    
+
     msg = await update.message.reply_text("Downloading...")
-    
+
     try:
         file = await context.bot.get_file(document.file_id)
         books_dir = Path("books")
         books_dir.mkdir(exist_ok=True)
-        
-        file_path = books_dir / document.file_name
+
+        file_path = books_dir / filename
         await file.download_to_drive(file_path)
         
         await msg.edit_text("Processing book...")
