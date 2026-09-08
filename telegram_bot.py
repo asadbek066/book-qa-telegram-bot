@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 MAX_BOOK_SIZE_BYTES = 20 * 1024 * 1024
 MAX_QUESTION_LENGTH = 1_000
+MAX_SOURCE_EXCERPT_CHARACTERS = 600
 MAX_ACTIVE_USERS = 32
 MAX_PERSISTED_CANDIDATES = 32
 BOOKS_DIR = Path(os.getenv("BOOKS_DIR", "books"))
@@ -220,6 +221,20 @@ async def _safe_edit(message: object, text: str) -> None:
         _log_failure("status update", exc)
 
 
+def _format_source_excerpts(chunks: list[str]) -> str:
+    """Format bounded, numbered retrieval excerpts for user verification."""
+    excerpts: list[str] = []
+    for index, chunk in enumerate(chunks, start=1):
+        excerpt = " ".join(chunk.split())
+        if len(excerpt) > MAX_SOURCE_EXCERPT_CHARACTERS:
+            excerpt = (
+                excerpt[: MAX_SOURCE_EXCERPT_CHARACTERS - 3].rstrip() + "..."
+            )
+        if excerpt:
+            excerpts.append(f"[{index}] {excerpt}")
+    return "\n".join(excerpts) or "No source excerpt available"
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     del context
     msg = (
@@ -354,10 +369,15 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("Searching...")
 
     try:
-        answer, _chunks = await asyncio.to_thread(
+        answer, chunks = await asyncio.to_thread(
             kb_ref.answer_question, question, 2, True
         )
-        response = f"Q: {question}\n\nA: {answer}"
+        response = (
+            f"Q: {question}\n\n"
+            f"A: [1] {answer}\n\n"
+            "Sources (retrieved excerpts):\n"
+            f"{_format_source_excerpts(chunks)}"
+        )
         await _safe_edit(msg, response)
     except Exception as exc:  # noqa: BLE001 - model failures are user-safe
         _log_failure("question answering", exc)

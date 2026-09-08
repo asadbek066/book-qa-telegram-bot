@@ -273,9 +273,15 @@ class BookKnowledgeBase:
             ):
                 return False
 
-            embedding_values = np.array(
-                embedding_array, dtype=np.float32, copy=True, order="C"
-            )
+            with np.errstate(over="ignore", invalid="ignore"):
+                embedding_values = np.array(
+                    embedding_array, dtype=np.float32, copy=True, order="C"
+                )
+            # A finite float64 cache value can overflow while being converted to
+            # float32. Reject the converted representation before similarity
+            # search sees it.
+            if not np.isfinite(embedding_values).all():
+                return False
             if payload.get("embedding_sha256") != self._embedding_digest(
                 embedding_values
             ):

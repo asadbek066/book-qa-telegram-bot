@@ -299,6 +299,18 @@ class TelegramBotBoundaryTests(unittest.TestCase):
             )
         )
 
+    def test_question_response_includes_bounded_retrieval_sources(self):
+        telegram_bot.user_books[101] = FakeKnowledgeBase("one")
+        telegram_bot.user_books[101].documents = ["user one"]
+        update = self.update_for(101, text="What is private?")
+
+        asyncio.run(telegram_bot.handle_question(update, SimpleNamespace()))
+
+        response = update.message.messages[-1]
+        self.assertIn("A: [1] answer for What is private?", response)
+        self.assertIn("Sources (retrieved excerpts):", response)
+        self.assertIn("[1] private document", response)
+
     def test_question_without_a_book_does_not_use_another_user_book(self):
         telegram_bot.user_books[101] = FakeKnowledgeBase("one")
         telegram_bot.user_books[101].documents = ["user one"]
