@@ -13,7 +13,7 @@ and returns a concise answer.
 - Upload PDF or TXT files directly in Telegram
 - Extract and chunk book content for retrieval
 - Embedding-based similarity search with `sentence-transformers`
-- Short, context-based answers from top relevant chunks
+- Short, context-based answers from top relevant chunks with numbered source excerpts
 - Basic commands for loading, summary, and help
 - Per-user book isolation with collision-resistant temporary storage
 - Bounded uploads and extraction to protect the bot from resource exhaustion
@@ -38,6 +38,9 @@ and returns a concise answer.
 2. Install dependencies:
 
 ```bash
+# The bot uses CPU inference by default. Install the CPU Torch wheel first so
+# pip does not select the much larger CUDA distribution.
+pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.2,<3"
 pip install -r requirements.txt
 ```
 
@@ -68,7 +71,9 @@ Available commands:
 
 ## Notes
 
-- Answers are retrieval-based and limited by extracted text quality.
+- Answers are retrieval-based and limited by extracted text quality. Telegram responses include
+  bounded numbered retrieval excerpts so users can verify what text supported the answer; these
+  are excerpt citations rather than PDF page numbers.
 - Scanned PDFs without selectable text may not work well.
 - Uploads are limited to 20 MB, PDFs to 500 pages, and extracted text to 2 million characters.
 - Each Telegram user has an independent active book. Source uploads are removed after processing;

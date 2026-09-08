@@ -1,8 +1,10 @@
+import hashlib
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from book_qa import (
@@ -116,6 +118,40 @@ class BookKnowledgeBaseTests(unittest.TestCase):
 
             restored = BookKnowledgeBase(model=FakeEmbeddingModel(), storage_dir=cache)
             self.assertFalse(restored.load_embeddings())
+
+    def test_cache_rejects_values_that_overflow_during_float32_conversion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "cache"
+            cache.mkdir()
+            infinite_embedding = torch.tensor([[float("inf")]], dtype=torch.float32)
+            (cache / "book_documents.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "model_name": "all-MiniLM-L6-v2",
+                        "book_name": "notes",
+                        "embedding_sha256": hashlib.sha256(
+                            infinite_embedding.numpy().tobytes()
+                        ).hexdigest(),
+                        "documents": ["document"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (cache / "book_embeddings.npy").open("wb") as file:
+                np.save(
+                    file,
+                    np.array([[np.finfo(np.float64).max]], dtype=np.float64),
+                    allow_pickle=False,
+                )
+
+            restored = BookKnowledgeBase(
+                model=FakeEmbeddingModel(), storage_dir=cache
+            )
+            self.assertFalse(restored.load_embeddings())
+            self.assertEqual(restored.documents, [])
+            self.assertIsNone(restored.embeddings)
 
     def test_oversized_cache_files_are_rejected_before_deserialization(self):
         with tempfile.TemporaryDirectory() as directory:
