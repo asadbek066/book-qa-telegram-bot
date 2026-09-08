@@ -15,6 +15,8 @@ and returns a concise answer.
 - Embedding-based similarity search with `sentence-transformers`
 - Short, context-based answers from top relevant chunks
 - Basic commands for loading, summary, and help
+- Per-user book isolation with collision-resistant temporary storage
+- Bounded uploads and extraction to protect the bot from resource exhaustion
 
 ## Tech Stack
 
@@ -68,4 +70,12 @@ Available commands:
 
 - Answers are retrieval-based and limited by extracted text quality.
 - Scanned PDFs without selectable text may not work well.
-- Embeddings and temporary files are stored locally.
+- Uploads are limited to 20 MB, PDFs to 500 pages, and extracted text to 2 million characters.
+- Each Telegram user has an independent active book. Source uploads are removed after processing;
+  the active user-scoped embedding cache remains under `embeddings/<telegram-user-id>/`.
+- The process keeps at most 32 active users' books in memory; evicted users can upload their book again.
+- After a restart, the newest valid cache for a user is restored on that user's first interaction.
+- Embeddings are stored as NumPy arrays and documents as JSON. Cache writes are atomic and cache
+  contents are validated before use; legacy pickle caches are not loaded.
+- The bot has no owner allowlist. Keep the bot token private and treat the local `books/` and
+  `embeddings/` directories as sensitive. Restrict filesystem access to the bot process.

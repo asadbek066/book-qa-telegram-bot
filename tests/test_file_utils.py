@@ -15,10 +15,18 @@ class NormalizeBookFilenameTests(unittest.TestCase):
         self.assertEqual(normalize_book_filename("BOOK.PDF"), "BOOK.PDF")
 
     def test_rejects_unsupported_or_empty_names(self):
-        for filename in ("script.py", "archive.pdf.exe", "", "."):
-            with self.subTest(filename=filename):
-                with self.assertRaises(ValueError):
-                    normalize_book_filename(filename)
+        for filename in (
+            "script.py",
+            "archive.pdf.exe",
+            "",
+            ".",
+            "book\x00.txt",
+            "book\n.txt",
+            "a" * 129 + ".txt",
+            None,
+        ):
+            with self.subTest(filename=filename), self.assertRaises(ValueError):
+                normalize_book_filename(filename)
 
 
 if __name__ == "__main__":
