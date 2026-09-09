@@ -18,6 +18,12 @@ class FakeStatus:
         self.messages.append(text)
 
 
+class FailingStatus(FakeStatus):
+    async def edit_text(self, text):
+        del text
+        raise RuntimeError("status message disappeared")
+
+
 class FakeMessage:
     def __init__(self, messages, document=None, text=None):
         self.messages = messages
@@ -87,20 +93,26 @@ class TelegramBotBoundaryTests(unittest.TestCase):
         telegram_bot.user_books.clear()
         telegram_bot._user_storage_dirs.clear()
         telegram_bot._user_locks.clear()
+        telegram_bot._active_user_order.clear()
+        telegram_bot._request_history.clear()
 
     def tearDown(self):
         telegram_bot.user_books.clear()
         telegram_bot._user_storage_dirs.clear()
         telegram_bot._user_locks.clear()
+        telegram_bot._active_user_order.clear()
+        telegram_bot._request_history.clear()
         for active_patch in reversed(self.patches):
             active_patch.stop()
         self.temp_dir.cleanup()
 
     @staticmethod
-    def update_for(user_id, document=None, text=None):
+    def update_for(user_id, document=None, text=None, chat_id=None):
         message = FakeMessage([], document=document, text=text)
         return SimpleNamespace(
-            message=message, effective_user=SimpleNamespace(id=user_id)
+            message=message,
+            effective_user=SimpleNamespace(id=user_id),
+            effective_chat=SimpleNamespace(id=user_id if chat_id is None else chat_id),
         )
 
     def test_same_filename_is_isolated_between_users(self):
@@ -113,13 +125,36 @@ class TelegramBotBoundaryTests(unittest.TestCase):
 
         asyncio.run(run())
 
-        self.assertEqual(set(telegram_bot.user_books), {101, 202})
-        self.assertIsNot(telegram_bot.user_books[101], telegram_bot.user_books[202])
+        self.assertEqual(set(telegram_bot.user_books), {(101, 101), (202, 202)})
+        self.assertIsNot(
+            telegram_bot.user_books[(101, 101)], telegram_bot.user_books[(202, 202)]
+        )
         self.assertNotEqual(
-            telegram_bot._user_storage_dirs[101], telegram_bot._user_storage_dirs[202]
+            telegram_bot._user_storage_dirs[(101, 101)],
+            telegram_bot._user_storage_dirs[(202, 202)],
         )
         self.assertTrue(
             any(message.startswith("Book loaded: same") for message in self.messages)
+        )
+
+    def test_same_user_is_isolated_between_chat_sessions(self):
+        async def run():
+            context = SimpleNamespace(bot=FakeBot(b"book text"))
+            await telegram_bot.handle_document(
+                self.update_for(101, BookDocument("group-one.txt"), chat_id=-1001),
+                context,
+            )
+            await telegram_bot.handle_document(
+                self.update_for(101, BookDocument("group-two.txt"), chat_id=-1002),
+                context,
+            )
+
+        asyncio.run(run())
+
+        self.assertEqual(len(telegram_bot.user_books), 2)
+        self.assertNotEqual(
+            telegram_bot._user_storage_dirs[(-1001, 101)],
+            telegram_bot._user_storage_dirs[(-1002, 101)],
         )
 
     def test_same_user_uploads_are_serialized(self):
@@ -157,8 +192,8 @@ class TelegramBotBoundaryTests(unittest.TestCase):
         asyncio.run(run())
 
         self.assertEqual(maximum_active, 1)
-        self.assertEqual(set(telegram_bot.user_books), {101})
-        self.assertTrue(telegram_bot._user_storage_dirs[101].is_dir())
+        self.assertEqual(set(telegram_bot.user_books), {(101, 101)})
+        self.assertTrue(telegram_bot._user_storage_dirs[(101, 101)].is_dir())
 
     def test_active_book_memory_is_bounded_without_cross_user_access(self):
         async def run():
@@ -174,7 +209,7 @@ class TelegramBotBoundaryTests(unittest.TestCase):
 
         asyncio.run(run())
 
-        self.assertEqual(set(telegram_bot.user_books), {202})
+        self.assertEqual(set(telegram_bot.user_books), {(202, 202)})
         update = self.update_for(101, text="What was in my book?")
         asyncio.run(telegram_bot.handle_question(update, SimpleNamespace()))
         self.assertEqual(update.message.messages, ["No book loaded. Use /load_book"])
@@ -197,7 +232,7 @@ class TelegramBotBoundaryTests(unittest.TestCase):
             knowledge_base = telegram_bot.get_kb(303)
 
         self.assertEqual(knowledge_base.get_book_summary(), "Book: restored\nChunks: 1")
-        self.assertEqual(telegram_bot._user_storage_dirs[303], storage_dir)
+        self.assertEqual(telegram_bot._user_storage_dirs[(303, 303)], storage_dir)
 
     def test_download_failure_is_generic_and_cleans_temporary_paths(self):
         class FailingBot:
@@ -285,8 +320,8 @@ class TelegramBotBoundaryTests(unittest.TestCase):
         self.assertEqual(telegram_bot.user_books, {})
 
     def test_question_uses_only_requesting_users_book(self):
-        telegram_bot.user_books[101] = FakeKnowledgeBase("one")
-        telegram_bot.user_books[101].documents = ["user one"]
+        telegram_bot.user_books[(101, 101)] = FakeKnowledgeBase("one")
+        telegram_bot.user_books[(101, 101)].documents = ["user one"]
         update = self.update_for(101, text="What is private?")
         context = SimpleNamespace()
 
@@ -300,8 +335,8 @@ class TelegramBotBoundaryTests(unittest.TestCase):
         )
 
     def test_question_response_includes_bounded_retrieval_sources(self):
-        telegram_bot.user_books[101] = FakeKnowledgeBase("one")
-        telegram_bot.user_books[101].documents = ["user one"]
+        telegram_bot.user_books[(101, 101)] = FakeKnowledgeBase("one")
+        telegram_bot.user_books[(101, 101)].documents = ["user one"]
         update = self.update_for(101, text="What is private?")
 
         asyncio.run(telegram_bot.handle_question(update, SimpleNamespace()))
@@ -311,9 +346,71 @@ class TelegramBotBoundaryTests(unittest.TestCase):
         self.assertIn("Sources (retrieved excerpts):", response)
         self.assertIn("[1] private document", response)
 
+    def test_question_response_is_capped_to_telegram_message_limit(self):
+        class HugeAnswerKnowledgeBase(FakeKnowledgeBase):
+            def answer_question(self, question, top_k, short):
+                del question, top_k, short
+                return "x" * 10_000, ["source"]
+
+        key = (101, 101)
+        telegram_bot.user_books[key] = HugeAnswerKnowledgeBase("one")
+        telegram_bot.user_books[key].documents = ["user one"]
+        update = self.update_for(101, text="What is private?")
+
+        asyncio.run(telegram_bot.handle_question(update, SimpleNamespace()))
+
+        response = update.message.messages[-1]
+        self.assertLessEqual(
+            len(response), telegram_bot.MAX_TELEGRAM_MESSAGE_CHARACTERS
+        )
+        self.assertTrue(response.endswith("..."))
+
+    def test_question_falls_back_to_new_reply_when_status_edit_fails(self):
+        class EditFailingMessage(FakeMessage):
+            async def reply_text(self, text):
+                self.messages.append(text)
+                return FailingStatus(self.messages)
+
+        telegram_bot.user_books[(101, 101)] = FakeKnowledgeBase("one")
+        telegram_bot.user_books[(101, 101)].documents = ["user one"]
+        messages = []
+        update = SimpleNamespace(
+            message=EditFailingMessage(messages, text="What is private?"),
+            effective_user=SimpleNamespace(id=101),
+            effective_chat=SimpleNamespace(id=101),
+        )
+
+        asyncio.run(telegram_bot.handle_question(update, SimpleNamespace()))
+
+        self.assertEqual(messages[0], "Searching...")
+        self.assertIn("answer for What is private?", messages[-1])
+
+    def test_upload_rate_limit_rejects_excess_work(self):
+        async def run():
+            with patch.object(telegram_bot, "MAX_UPLOADS_PER_WINDOW", 1):
+                context = SimpleNamespace(bot=FakeBot(b"book text"))
+                await telegram_bot.handle_document(
+                    self.update_for(101, BookDocument("first.txt")), context
+                )
+                second_update = self.update_for(101, BookDocument("second.txt"))
+                await telegram_bot.handle_document(second_update, context)
+                return second_update
+
+        second_update = asyncio.run(run())
+
+        self.assertIn("too many uploads", second_update.message.messages[-1].lower())
+
+    def test_request_tracking_memory_is_bounded(self):
+        with patch.object(telegram_bot, "MAX_TRACKED_SESSIONS", 2):
+            for session_key in ((1, 1), (2, 2), (3, 3)):
+                self.assertTrue(telegram_bot._allow_request(session_key, "question", 1))
+
+        self.assertEqual(len(telegram_bot._request_history), 2)
+        self.assertNotIn((1, 1), telegram_bot._request_history)
+
     def test_question_without_a_book_does_not_use_another_user_book(self):
-        telegram_bot.user_books[101] = FakeKnowledgeBase("one")
-        telegram_bot.user_books[101].documents = ["user one"]
+        telegram_bot.user_books[(101, 101)] = FakeKnowledgeBase("one")
+        telegram_bot.user_books[(101, 101)].documents = ["user one"]
         update = self.update_for(202, text="What is private?")
 
         asyncio.run(telegram_bot.handle_question(update, SimpleNamespace()))
@@ -321,8 +418,8 @@ class TelegramBotBoundaryTests(unittest.TestCase):
         self.assertEqual(update.message.messages, ["No book loaded. Use /load_book"])
 
     def test_question_length_is_bounded(self):
-        telegram_bot.user_books[101] = FakeKnowledgeBase("one")
-        telegram_bot.user_books[101].documents = ["user one"]
+        telegram_bot.user_books[(101, 101)] = FakeKnowledgeBase("one")
+        telegram_bot.user_books[(101, 101)].documents = ["user one"]
         update = self.update_for(101, text="x" * (telegram_bot.MAX_QUESTION_LENGTH + 1))
 
         asyncio.run(telegram_bot.handle_question(update, SimpleNamespace()))
