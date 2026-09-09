@@ -146,9 +146,7 @@ class BookKnowledgeBaseTests(unittest.TestCase):
                     allow_pickle=False,
                 )
 
-            restored = BookKnowledgeBase(
-                model=FakeEmbeddingModel(), storage_dir=cache
-            )
+            restored = BookKnowledgeBase(model=FakeEmbeddingModel(), storage_dir=cache)
             self.assertFalse(restored.load_embeddings())
             self.assertEqual(restored.documents, [])
             self.assertIsNone(restored.embeddings)

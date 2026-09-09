@@ -3,9 +3,10 @@ import logging
 import os
 import shutil
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from contextlib import suppress
 from pathlib import Path
+from time import monotonic
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -29,18 +30,26 @@ logger = logging.getLogger(__name__)
 MAX_BOOK_SIZE_BYTES = 20 * 1024 * 1024
 MAX_QUESTION_LENGTH = 1_000
 MAX_SOURCE_EXCERPT_CHARACTERS = 600
+MAX_TELEGRAM_MESSAGE_CHARACTERS = 4_000
 MAX_ACTIVE_USERS = 32
 MAX_PERSISTED_CANDIDATES = 32
+MAX_TRACKED_SESSIONS = 1_024
+RATE_LIMIT_WINDOW_SECONDS = 60.0
+MAX_UPLOADS_PER_WINDOW = 5
+MAX_QUESTIONS_PER_WINDOW = 30
 BOOKS_DIR = Path(os.getenv("BOOKS_DIR", "books"))
 EMBEDDINGS_DIR = Path(os.getenv("EMBEDDINGS_DIR", "embeddings"))
 
-# Each user gets a separate in-memory knowledge base and a separate cache directory.
+SessionKey = tuple[int, int]
+
+# Each chat/user session gets a separate in-memory knowledge base and cache.
 # The uploaded source file is removed after processing, while the cache is retained
 # only for the current active book.
-user_books: dict[int, BookKnowledgeBase] = {}
-_user_storage_dirs: dict[int, Path] = {}
-_user_locks: dict[int, asyncio.Lock] = {}
-_active_user_order: OrderedDict[int, None] = OrderedDict()
+user_books: dict[SessionKey, BookKnowledgeBase] = {}
+_user_storage_dirs: dict[SessionKey, Path] = {}
+_user_locks: dict[SessionKey, asyncio.Lock] = {}
+_active_user_order: OrderedDict[SessionKey, None] = OrderedDict()
+_request_history: dict[SessionKey, dict[str, deque[float]]] = {}
 
 
 def _validate_user_id(user_id: object) -> int:
@@ -49,32 +58,59 @@ def _validate_user_id(user_id: object) -> int:
     return user_id
 
 
-def _user_lock(user_id: int) -> asyncio.Lock:
-    lock = _user_locks.get(user_id)
+def _validate_chat_id(chat_id: object) -> int:
+    if not isinstance(chat_id, int) or isinstance(chat_id, bool):
+        raise ValueError("invalid Telegram chat id")  # noqa: TRY004 - caller reports bad update
+    return chat_id
+
+
+def _session_key(user_id: object, chat_id: object) -> SessionKey:
+    return (_validate_chat_id(chat_id), _validate_user_id(user_id))
+
+
+def _session_key_for_update(update: Update) -> SessionKey:
+    user = getattr(update, "effective_user", None)
+    user_id = _validate_user_id(getattr(user, "id", None))
+    chat = getattr(update, "effective_chat", None)
+    chat_id = getattr(chat, "id", None)
+    if chat_id is None:
+        message = getattr(update, "message", None)
+        chat_id = getattr(getattr(message, "chat", None), "id", None)
+    # Real Telegram messages always carry a chat. The private-chat fallback
+    # preserves compatibility with small local update fakes and old caches.
+    return _session_key(user_id, user_id if chat_id is None else chat_id)
+
+
+def _user_lock(session_key: SessionKey) -> asyncio.Lock:
+    lock = _user_locks.get(session_key)
     if lock is None:
         lock = asyncio.Lock()
-        _user_locks[user_id] = lock
+        _user_locks[session_key] = lock
     return lock
 
 
-def _touch_active_user(user_id: int) -> None:
-    _active_user_order.pop(user_id, None)
-    _active_user_order[user_id] = None
+def _touch_active_user(session_key: SessionKey) -> None:
+    _active_user_order.pop(session_key, None)
+    _active_user_order[session_key] = None
 
 
-def _evict_active_user(exempt_user_id: int) -> None:
+def _evict_active_user(exempt_session_key: SessionKey) -> None:
     while len(user_books) >= MAX_ACTIVE_USERS:
         candidate = next(
             (
-                user_id
-                for user_id in _active_user_order
-                if user_id != exempt_user_id and user_id in user_books
+                session_key
+                for session_key in _active_user_order
+                if session_key != exempt_session_key and session_key in user_books
             ),
             None,
         )
         if candidate is None:
             candidate = next(
-                (user_id for user_id in user_books if user_id != exempt_user_id),
+                (
+                    session_key
+                    for session_key in user_books
+                    if session_key != exempt_session_key
+                ),
                 None,
             )
         if candidate is None:
@@ -85,10 +121,20 @@ def _evict_active_user(exempt_user_id: int) -> None:
         previous_storage = _user_storage_dirs.pop(candidate, None)
         if previous_storage is not None:
             _remove_directory(previous_storage)
+        _request_history.pop(candidate, None)
 
 
-def _restore_latest_book(user_id: int) -> BookKnowledgeBase | None:
-    user_storage_root = EMBEDDINGS_DIR / str(user_id)
+def _session_storage_root(base_dir: Path, session_key: SessionKey) -> Path:
+    chat_id, user_id = session_key
+    if chat_id == user_id:
+        # Private-chat caches from the previous user-scoped format remain
+        # restorable. Group chats always use a distinct namespace.
+        return base_dir / str(user_id)
+    return base_dir / f"chat-{chat_id}" / str(user_id)
+
+
+def _restore_latest_book(session_key: SessionKey) -> BookKnowledgeBase | None:
+    user_storage_root = _session_storage_root(EMBEDDINGS_DIR, session_key)
     try:
         candidates = [
             path
@@ -108,28 +154,37 @@ def _restore_latest_book(user_id: int) -> BookKnowledgeBase | None:
     for storage_dir in candidates[:MAX_PERSISTED_CANDIDATES]:
         knowledge_base = BookKnowledgeBase(storage_dir=storage_dir)
         if knowledge_base.load_embeddings():
-            _user_storage_dirs[user_id] = storage_dir
+            _user_storage_dirs[session_key] = storage_dir
             return knowledge_base
     return None
 
 
-def get_kb(user_id: int) -> BookKnowledgeBase:
-    user_id = _validate_user_id(user_id)
-    if user_id not in user_books:
-        _evict_active_user(user_id)
-        user_books[user_id] = _restore_latest_book(user_id) or BookKnowledgeBase(
-            storage_dir=EMBEDDINGS_DIR / str(user_id)
+def _get_kb(session_key: SessionKey) -> BookKnowledgeBase:
+    if session_key not in user_books:
+        _evict_active_user(session_key)
+        user_books[session_key] = _restore_latest_book(
+            session_key
+        ) or BookKnowledgeBase(
+            storage_dir=_session_storage_root(EMBEDDINGS_DIR, session_key)
         )
-    _touch_active_user(user_id)
-    return user_books[user_id]
+    _touch_active_user(session_key)
+    return user_books[session_key]
 
 
-def _new_book_paths(user_id: int, filename: str) -> tuple[Path, Path]:
+def get_kb(user_id: int, chat_id: int | None = None) -> BookKnowledgeBase:
     user_id = _validate_user_id(user_id)
+    session_key = _session_key(user_id, user_id if chat_id is None else chat_id)
+    return _get_kb(session_key)
+
+
+def _new_book_paths(
+    user_id: int, filename: str, chat_id: int | None = None
+) -> tuple[Path, Path]:
+    session_key = _session_key(user_id, user_id if chat_id is None else chat_id)
     filename = normalize_book_filename(filename)
     upload_id = uuid.uuid4().hex
-    book_dir = BOOKS_DIR / str(user_id)
-    embedding_dir = EMBEDDINGS_DIR / str(user_id) / upload_id
+    book_dir = _session_storage_root(BOOKS_DIR, session_key)
+    embedding_dir = _session_storage_root(EMBEDDINGS_DIR, session_key) / upload_id
     return book_dir / f"{upload_id}_{filename}", embedding_dir
 
 
@@ -140,6 +195,26 @@ def _validate_document_size(document: object) -> bool:
     if not isinstance(declared_size, int) or isinstance(declared_size, bool):
         return False
     return 0 <= declared_size <= MAX_BOOK_SIZE_BYTES
+
+
+def _allow_request(session_key: SessionKey, bucket: str, limit: int) -> bool:
+    now = monotonic()
+    session_history = _request_history.get(session_key)
+    if session_history is None:
+        if len(_request_history) >= MAX_TRACKED_SESSIONS:
+            oldest_session = next(iter(_request_history), None)
+            if oldest_session is not None:
+                _request_history.pop(oldest_session, None)
+        session_history = {}
+        _request_history[session_key] = session_history
+    history = session_history.setdefault(bucket, deque())
+    cutoff = now - RATE_LIMIT_WINDOW_SECONDS
+    while history and history[0] <= cutoff:
+        history.popleft()
+    if len(history) >= limit:
+        return False
+    history.append(now)
+    return True
 
 
 def _log_failure(operation: str, error: Exception) -> None:
@@ -214,22 +289,41 @@ async def _wait_for_processing(
         raise
 
 
-async def _safe_edit(message: object, text: str) -> None:
+def _bounded_message(text: object) -> str:
+    if not isinstance(text, str):
+        text = str(text)
+    if len(text) <= MAX_TELEGRAM_MESSAGE_CHARACTERS:
+        return text
+    return text[: MAX_TELEGRAM_MESSAGE_CHARACTERS - 3].rstrip() + "..."
+
+
+async def _safe_edit(message: object, text: str) -> bool:
     try:
-        await message.edit_text(text)  # type: ignore[attr-defined]
+        await message.edit_text(_bounded_message(text))  # type: ignore[attr-defined]
+        return True
     except Exception as exc:  # noqa: BLE001 - Telegram status updates are best effort
         _log_failure("status update", exc)
+        return False
+
+
+async def _safe_reply(message: object, text: str) -> bool:
+    try:
+        await message.reply_text(_bounded_message(text))  # type: ignore[attr-defined]
+        return True
+    except Exception as exc:  # noqa: BLE001 - Telegram replies are best effort
+        _log_failure("reply", exc)
+        return False
 
 
 def _format_source_excerpts(chunks: list[str]) -> str:
     """Format bounded, numbered retrieval excerpts for user verification."""
     excerpts: list[str] = []
     for index, chunk in enumerate(chunks, start=1):
+        if not isinstance(chunk, str):
+            continue
         excerpt = " ".join(chunk.split())
         if len(excerpt) > MAX_SOURCE_EXCERPT_CHARACTERS:
-            excerpt = (
-                excerpt[: MAX_SOURCE_EXCERPT_CHARACTERS - 3].rstrip() + "..."
-            )
+            excerpt = excerpt[: MAX_SOURCE_EXCERPT_CHARACTERS - 3].rstrip() + "..."
         if excerpt:
             excerpts.append(f"[{index}] {excerpt}")
     return "\n".join(excerpts) or "No source excerpt available"
@@ -263,14 +357,21 @@ async def load_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     del context
-    user_id = update.effective_user.id
-    text = get_kb(user_id).get_book_summary()
+    session_key = _session_key_for_update(update)
+    text = _get_kb(session_key).get_book_summary()
     await update.message.reply_text(text)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     document = update.message.document
-    user_id = _validate_user_id(update.effective_user.id)
+    session_key = _session_key_for_update(update)
+    chat_id, user_id = session_key
+
+    if not _allow_request(session_key, "upload", MAX_UPLOADS_PER_WINDOW):
+        await update.message.reply_text(
+            "Too many uploads. Please wait a little before trying again."
+        )
+        return
 
     try:
         filename = normalize_book_filename(document.file_name)
@@ -284,9 +385,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    async with _user_lock(user_id):
+    async with _user_lock(session_key):
         msg = await update.message.reply_text("Downloading...")
-        file_path, embedding_dir = _new_book_paths(user_id, filename)
+        file_path, embedding_dir = _new_book_paths(user_id, filename, chat_id)
         processing_task: asyncio.Task[BookKnowledgeBase | None] | None = None
 
         try:
@@ -299,9 +400,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 not file_path.is_file()
                 or file_path.stat().st_size > MAX_BOOK_SIZE_BYTES
             ):
-                await _safe_edit(
-                    msg, "That book is too large. The maximum supported size is 20 MB."
+                response = (
+                    "That book is too large. The maximum supported size is 20 MB."
                 )
+                if not await _safe_edit(msg, response):
+                    await _safe_reply(update.message, response)
                 return
             file_path.chmod(0o600)
 
@@ -317,32 +420,32 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb_ref = await _wait_for_processing(processing_task, embedding_dir)
 
             if kb_ref is None:
-                await _safe_edit(
-                    msg,
-                    "I could not process that book. Please upload a text-based PDF or TXT file.",
-                )
+                response = "I could not process that book. Please upload a text-based PDF or TXT file."
+                if not await _safe_edit(msg, response):
+                    await _safe_reply(update.message, response)
                 return
 
-            if user_id not in user_books:
-                _evict_active_user(user_id)
-            previous_storage = _user_storage_dirs.get(user_id)
-            user_books[user_id] = kb_ref
-            _user_storage_dirs[user_id] = embedding_dir
-            _touch_active_user(user_id)
+            if session_key not in user_books:
+                _evict_active_user(session_key)
+            previous_storage = _user_storage_dirs.get(session_key)
+            user_books[session_key] = kb_ref
+            _user_storage_dirs[session_key] = embedding_dir
+            _touch_active_user(session_key)
             if previous_storage and previous_storage != embedding_dir:
                 _remove_directory(previous_storage)
 
-            await _safe_edit(
-                msg,
+            response = (
                 f"Book loaded: {kb_ref.book_name}\n"
                 f"Chunks: {len(kb_ref.documents)}\n\n"
-                "Ready to answer questions!",
+                "Ready to answer questions!"
             )
+            if not await _safe_edit(msg, response):
+                await _safe_reply(update.message, response)
         except Exception as exc:  # noqa: BLE001 - upload failures are user-safe
             _log_failure("book upload", exc)
-            await _safe_edit(
-                msg, "I could not download or process that book. Please try again."
-            )
+            response = "I could not download or process that book. Please try again."
+            if not await _safe_edit(msg, response):
+                await _safe_reply(update.message, response)
         finally:
             if processing_task is None:
                 _remove_file(file_path)
@@ -352,7 +455,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     del context
     question = update.message.text or ""
-    user_id = _validate_user_id(update.effective_user.id)
+    session_key = _session_key_for_update(update)
+
+    if not _allow_request(session_key, "question", MAX_QUESTIONS_PER_WINDOW):
+        await update.message.reply_text(
+            "Too many questions. Please wait a little before trying again."
+        )
+        return
 
     if len(question) > MAX_QUESTION_LENGTH:
         await update.message.reply_text(
@@ -360,11 +469,11 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    kb_ref = get_kb(user_id)
+    kb_ref = _get_kb(session_key)
     if kb_ref is None or not kb_ref.documents:
         await update.message.reply_text("No book loaded. Use /load_book")
         return
-    _touch_active_user(user_id)
+    _touch_active_user(session_key)
 
     msg = await update.message.reply_text("Searching...")
 
@@ -372,18 +481,19 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
         answer, chunks = await asyncio.to_thread(
             kb_ref.answer_question, question, 2, True
         )
-        response = (
+        response = _bounded_message(
             f"Q: {question}\n\n"
             f"A: [1] {answer}\n\n"
             "Sources (retrieved excerpts):\n"
             f"{_format_source_excerpts(chunks)}"
         )
-        await _safe_edit(msg, response)
+        if not await _safe_edit(msg, response):
+            await _safe_reply(update.message, response)
     except Exception as exc:  # noqa: BLE001 - model failures are user-safe
         _log_failure("question answering", exc)
-        await _safe_edit(
-            msg, "I could not answer that question right now. Please try again."
-        )
+        response = "I could not answer that question right now. Please try again."
+        if not await _safe_edit(msg, response):
+            await _safe_reply(update.message, response)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):

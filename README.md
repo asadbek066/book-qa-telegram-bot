@@ -15,8 +15,9 @@ and returns a concise answer.
 - Embedding-based similarity search with `sentence-transformers`
 - Short, context-based answers from top relevant chunks with numbered source excerpts
 - Basic commands for loading, summary, and help
-- Per-user book isolation with collision-resistant temporary storage
-- Bounded uploads and extraction to protect the bot from resource exhaustion
+- Per-chat/user book isolation with collision-resistant temporary storage
+- Bounded uploads, extraction, Telegram responses, and per-session request rates
+  to protect the bot from resource exhaustion
 
 ## Tech Stack
 
@@ -38,11 +39,17 @@ and returns a concise answer.
 2. Install dependencies:
 
 ```bash
-# The bot uses CPU inference by default. Install the CPU Torch wheel first so
-# pip does not select the much larger CUDA distribution.
-pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.2,<3"
-pip install -r requirements.txt
+# The lock is resolved for Python 3.11 and selects the CPU Torch wheel. The
+# PyPI extra index supplies the non-Torch packages.
+python -m pip install \
+  --index-url https://download.pytorch.org/whl/cpu \
+  --extra-index-url https://pypi.org/simple \
+  -r requirements.lock
 ```
+
+`requirements.txt` is the human-maintained source constraint; regenerate
+`requirements.lock` with the command recorded at its top when dependencies
+are intentionally upgraded.
 
 3. Create `.env` from `.env.example` and set:
 
@@ -74,12 +81,17 @@ Available commands:
 - Answers are retrieval-based and limited by extracted text quality. Telegram responses include
   bounded numbered retrieval excerpts so users can verify what text supported the answer; these
   are excerpt citations rather than PDF page numbers.
+- Each response is capped below Telegram's message-size limit. If Telegram cannot edit the
+  temporary status message, the bot sends the completed response as a new reply.
 - Scanned PDFs without selectable text may not work well.
 - Uploads are limited to 20 MB, PDFs to 500 pages, and extracted text to 2 million characters.
-- Each Telegram user has an independent active book. Source uploads are removed after processing;
-  the active user-scoped embedding cache remains under `embeddings/<telegram-user-id>/`.
-- The process keeps at most 32 active users' books in memory; evicted users can upload their book again.
-- After a restart, the newest valid cache for a user is restored on that user's first interaction.
+- Each private chat and group-chat/user pair has an independent active book. Source uploads are
+  removed after processing; private-chat caches remain under `embeddings/<telegram-user-id>/`,
+  while group-chat caches are namespaced under `embeddings/chat-<telegram-chat-id>/`.
+- Uploads are limited to 5 per session per minute and questions to 30 per session per minute.
+- The process keeps at most 32 active chat sessions' books in memory; evicted sessions can upload
+  their book again.
+- After a restart, the newest valid cache for that chat session is restored on its first interaction.
 - Embeddings are stored as NumPy arrays and documents as JSON. Cache writes are atomic and cache
   contents are validated before use; legacy pickle caches are not loaded.
 - The bot has no owner allowlist. Keep the bot token private and treat the local `books/` and
