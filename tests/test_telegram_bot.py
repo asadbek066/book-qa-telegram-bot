@@ -95,6 +95,7 @@ class TelegramBotBoundaryTests(unittest.TestCase):
         telegram_bot.user_books.clear()
         telegram_bot._user_storage_dirs.clear()
         telegram_bot._user_locks.clear()
+        telegram_bot._user_lock_refs.clear()
         telegram_bot._active_user_order.clear()
         telegram_bot._request_history.clear()
 
@@ -102,6 +103,7 @@ class TelegramBotBoundaryTests(unittest.TestCase):
         telegram_bot.user_books.clear()
         telegram_bot._user_storage_dirs.clear()
         telegram_bot._user_locks.clear()
+        telegram_bot._user_lock_refs.clear()
         telegram_bot._active_user_order.clear()
         telegram_bot._request_history.clear()
         for active_patch in reversed(self.patches):
@@ -445,6 +447,52 @@ class TelegramBotBoundaryTests(unittest.TestCase):
         self.assertNotIn((1, 1), telegram_bot._user_locks)
         self.assertIn((2, 2), telegram_bot._user_locks)
         self.assertIn((3, 3), telegram_bot._user_locks)
+
+    def test_hold_user_lock_pins_through_the_critical_section(self):
+        seen = {}
+
+        async def scenario():
+            async with telegram_bot._hold_user_lock((1, 1)):
+                telegram_bot.user_books[(1, 1)] = FakeKnowledgeBase("book")
+                telegram_bot._active_user_order[(1, 1)] = None
+                seen["lock"] = telegram_bot._user_locks[(1, 1)]
+                with patch.object(telegram_bot, "MAX_ACTIVE_USERS", 0):
+                    telegram_bot._evict_active_user((2, 2))
+                seen["lock_after"] = telegram_bot._user_locks.get((1, 1))
+                seen["book"] = (1, 1) in telegram_bot.user_books
+
+        asyncio.run(scenario())
+        self.assertIs(seen["lock_after"], seen["lock"])
+        self.assertTrue(seen["book"])
+
+    def test_eviction_skips_pinned_sessions(self):
+        for session_key in ((1, 1), (2, 2)):
+            telegram_bot.user_books[session_key] = FakeKnowledgeBase("book")
+            telegram_bot._active_user_order[session_key] = None
+            telegram_bot._user_locks[session_key] = asyncio.Lock()
+        # (1, 1) has an in-flight handler: its lock must survive eviction.
+        telegram_bot._user_lock_refs[(1, 1)] = 1
+
+        with patch.object(telegram_bot, "MAX_ACTIVE_USERS", 1):
+            telegram_bot._evict_active_user((3, 3))
+
+        self.assertIn((1, 1), telegram_bot.user_books)
+        self.assertIn((1, 1), telegram_bot._user_locks)
+        self.assertNotIn((2, 2), telegram_bot.user_books)
+
+    def test_eviction_leaves_books_in_place_when_every_candidate_is_pinned(self):
+        telegram_bot.user_books[(1, 1)] = FakeKnowledgeBase("book")
+        telegram_bot._active_user_order[(1, 1)] = None
+        telegram_bot._user_locks[(1, 1)] = asyncio.Lock()
+        telegram_bot._user_lock_refs[(1, 1)] = 1
+
+        with patch.object(telegram_bot, "MAX_ACTIVE_USERS", 1):
+            telegram_bot._evict_active_user((3, 3))
+
+        self.assertIn((1, 1), telegram_bot.user_books)
+        self.assertIn((1, 1), telegram_bot.user_books)
+        self.assertIn((1, 1), telegram_bot._user_locks)
+        self.assertIn((1, 1), telegram_bot._active_user_order)
 
 
 class TelegramBotApplicationBuilderTests(unittest.TestCase):
