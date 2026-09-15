@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import telegram_bot
+from telegram import User
+from telegram.ext import CommandHandler, MessageHandler
 
 
 class FakeStatus:
@@ -425,6 +427,153 @@ class TelegramBotBoundaryTests(unittest.TestCase):
         asyncio.run(telegram_bot.handle_question(update, SimpleNamespace()))
 
         self.assertIn("1,000 characters", update.message.messages[0])
+
+    def test_evicted_session_releases_its_lock(self):
+        for session_key in ((1, 1), (2, 2)):
+            telegram_bot.user_books[session_key] = FakeKnowledgeBase("book")
+            telegram_bot._active_user_order[session_key] = None
+            telegram_bot._user_locks[session_key] = asyncio.Lock()
+
+        with patch.object(telegram_bot, "MAX_ACTIVE_USERS", 2):
+            asyncio.run(
+                telegram_bot.handle_document(
+                    self.update_for(3, BookDocument("third.txt")),
+                    SimpleNamespace(bot=FakeBot(b"book text")),
+                )
+            )
+
+        self.assertNotIn((1, 1), telegram_bot._user_locks)
+        self.assertIn((2, 2), telegram_bot._user_locks)
+        self.assertIn((3, 3), telegram_bot._user_locks)
+
+
+class TelegramBotApplicationBuilderTests(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import AsyncMock
+
+        bot_user = User(
+            id=123, is_bot=True, first_name="Fake", username="fakebot"
+        )
+        self.patches = [
+            patch("telegram.Bot.get_me", new=AsyncMock(return_value=bot_user))
+        ]
+        for active_patch in self.patches:
+            active_patch.start()
+        self.addCleanup(lambda: [p.stop() for p in reversed(self.patches)])
+        asyncio.run(self._setup_application())
+
+    async def _setup_application(self):
+        self.application = telegram_bot._build_application("123:FAKETOKEN")
+        telegram_bot._install_handlers(self.application)
+        await self.application.initialize()
+        self.application.bot._bot_user = User(
+            id=123, is_bot=True, first_name="Fake", username="fakebot"
+        )
+
+    def tearDown(self):
+        asyncio.run(self.application.shutdown())
+
+    def test_updates_are_processed_with_a_bounded_concurrency(self):
+        self.assertEqual(
+            self.application.concurrent_updates,
+            telegram_bot.MAX_CONCURRENT_UPDATES,
+        )
+
+    def test_message_edits_and_channel_posts_never_reach_handlers(self):
+        from datetime import datetime, timezone
+
+        from telegram import Chat, Message, Update
+
+        now = datetime.now(timezone.utc)
+        document_edit = Update(
+            update_id=1,
+            edited_message=Message(
+                message_id=2,
+                date=now,
+                chat=Chat(id=1, type=Chat.PRIVATE),
+                document=SimpleNamespace(file_name="book.txt", file_size=10),
+            ),
+        )
+        text_edit = Update(
+            update_id=2,
+            edited_message=Message(
+                message_id=3, date=now, chat=Chat(id=1, type=Chat.PRIVATE), text="hello"
+            ),
+        )
+        command_edit = Update(
+            update_id=3,
+            edited_message=Message(
+                message_id=4, date=now, chat=Chat(id=1, type=Chat.PRIVATE), text="/start"
+            ),
+        )
+        for message in (
+            document_edit.edited_message,
+            text_edit.edited_message,
+            command_edit.edited_message,
+        ):
+            message.set_bot(self.application.bot)
+
+        handlers = self.application.handlers[0]
+        document_handler, question_handler = (
+            handler for handler in handlers if isinstance(handler, MessageHandler)
+        )
+        self.assertFalse(document_handler.check_update(document_edit))
+        self.assertFalse(question_handler.check_update(text_edit))
+        command_handlers = [h for h in handlers if isinstance(h, CommandHandler)]
+        self.assertGreaterEqual(len(command_handlers), 4)
+        for handler in command_handlers:
+            self.assertFalse(handler.check_update(command_edit))
+
+    def test_real_messages_still_reach_every_handler(self):
+        from datetime import datetime, timezone
+
+        from telegram import Chat, Message, MessageEntity, Update
+
+        now = datetime.now(timezone.utc)
+        chat = Chat(id=1, type=Chat.PRIVATE)
+        document_update = Update(
+            update_id=1,
+            message=Message(
+                message_id=2,
+                date=now,
+                chat=chat,
+                document=SimpleNamespace(file_name="book.txt", file_size=10),
+            ),
+        )
+        text_update = Update(
+            update_id=2,
+            message=Message(
+                message_id=3, date=now, chat=chat, text="plain question"
+            ),
+        )
+        start_update = Update(
+            update_id=3,
+            message=Message(
+                message_id=4,
+                date=now,
+                chat=chat,
+                text="/start",
+                entities=[MessageEntity(type=MessageEntity.BOT_COMMAND, offset=0, length=6)],
+            ),
+        )
+        for message in (
+            document_update.message,
+            text_update.message,
+            start_update.message,
+        ):
+            message.set_bot(self.application.bot)
+
+        handlers = self.application.handlers[0]
+        command_handlers = [h for h in handlers if isinstance(h, CommandHandler)]
+        self.assertTrue(
+            any(h.check_update(start_update) for h in command_handlers)
+        )
+        message_handlers = [
+            h for h in handlers if isinstance(h, MessageHandler)
+        ]
+        self.assertEqual(len(message_handlers), 2)
+        self.assertTrue(message_handlers[0].check_update(document_update))
+        self.assertTrue(message_handlers[1].check_update(text_update))
 
 
 if __name__ == "__main__":

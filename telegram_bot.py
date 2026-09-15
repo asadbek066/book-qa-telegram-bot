@@ -37,6 +37,7 @@ MAX_TRACKED_SESSIONS = 1_024
 RATE_LIMIT_WINDOW_SECONDS = 60.0
 MAX_UPLOADS_PER_WINDOW = 5
 MAX_QUESTIONS_PER_WINDOW = 30
+MAX_CONCURRENT_UPDATES = 16
 BOOKS_DIR = Path(os.getenv("BOOKS_DIR", "books"))
 EMBEDDINGS_DIR = Path(os.getenv("EMBEDDINGS_DIR", "embeddings"))
 
@@ -122,6 +123,7 @@ def _evict_active_user(exempt_session_key: SessionKey) -> None:
         if previous_storage is not None:
             _remove_directory(previous_storage)
         _request_history.pop(candidate, None)
+        _user_locks.pop(candidate, None)
 
 
 def _session_storage_root(base_dir: Path, session_key: SessionKey) -> Path:
@@ -502,6 +504,40 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         _log_failure("unhandled bot error", context.error)
 
 
+def _build_application(token: str) -> Application:
+    return (
+        Application.builder()
+        .token(token)
+        .concurrent_updates(MAX_CONCURRENT_UPDATES)
+        .build()
+    )
+
+
+def _install_handlers(application: Application) -> None:
+    message_only = filters.UpdateType.MESSAGE
+    application.add_handler(
+        CommandHandler("start", start, filters=message_only)
+    )
+    application.add_handler(
+        CommandHandler("help", help_command, filters=message_only)
+    )
+    application.add_handler(
+        CommandHandler("load_book", load_book, filters=message_only)
+    )
+    application.add_handler(
+        CommandHandler("summary", summary, filters=message_only)
+    )
+    application.add_handler(
+        MessageHandler(filters.Document.ALL & message_only, handle_document)
+    )
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & message_only, handle_question
+        )
+    )
+    application.add_error_handler(error_handler)
+
+
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
@@ -509,17 +545,8 @@ def main():
             "TELEGRAM_BOT_TOKEN is missing. Set it in .env before starting the bot."
         )
 
-    application = Application.builder().token(token).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("load_book", load_book))
-    application.add_handler(CommandHandler("summary", summary))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_question)
-    )
-    application.add_error_handler(error_handler)
+    application = _build_application(token)
+    _install_handlers(application)
 
     print("Bot starting...")
     application.run_polling()
