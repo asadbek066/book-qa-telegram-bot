@@ -4,7 +4,7 @@ import os
 import shutil
 import uuid
 from collections import OrderedDict, deque
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from time import monotonic
 
@@ -49,6 +49,7 @@ SessionKey = tuple[int, int]
 user_books: dict[SessionKey, BookKnowledgeBase] = {}
 _user_storage_dirs: dict[SessionKey, Path] = {}
 _user_locks: dict[SessionKey, asyncio.Lock] = {}
+_user_lock_refs: dict[SessionKey, int] = {}
 _active_user_order: OrderedDict[SessionKey, None] = OrderedDict()
 _request_history: dict[SessionKey, dict[str, deque[float]]] = {}
 
@@ -90,6 +91,30 @@ def _user_lock(session_key: SessionKey) -> asyncio.Lock:
     return lock
 
 
+@asynccontextmanager
+async def _hold_user_lock(session_key: SessionKey):
+    """Acquire a session's lock and pin it against eviction.
+
+    A lock must never be evicted while a task holds a reference to it: with
+    concurrent updates enabled, a queued task that survives eviction would
+    serialize on an orphaned lock while new tasks get a fresh one, letting
+    two handlers for the same session run their upload critical section
+    concurrently. The reference count tells eviction which locks are safe
+    to discard.
+    """
+    lock = _user_lock(session_key)
+    _user_lock_refs[session_key] = _user_lock_refs.get(session_key, 0) + 1
+    try:
+        async with lock:
+            yield lock
+    finally:
+        remaining = _user_lock_refs.get(session_key, 0) - 1
+        if remaining > 0:
+            _user_lock_refs[session_key] = remaining
+        else:
+            _user_lock_refs.pop(session_key, None)
+
+
 def _touch_active_user(session_key: SessionKey) -> None:
     _active_user_order.pop(session_key, None)
     _active_user_order[session_key] = None
@@ -102,6 +127,9 @@ def _evict_active_user(exempt_session_key: SessionKey) -> None:
                 session_key
                 for session_key in _active_user_order
                 if session_key != exempt_session_key and session_key in user_books
+                # A session whose lock is pinned by an in-flight handler must
+                # survive: evicting it would orphan that handler's lock.
+                and not _user_lock_refs.get(session_key)
             ),
             None,
         )
@@ -111,6 +139,7 @@ def _evict_active_user(exempt_session_key: SessionKey) -> None:
                     session_key
                     for session_key in user_books
                     if session_key != exempt_session_key
+                    and not _user_lock_refs.get(session_key)
                 ),
                 None,
             )
@@ -387,7 +416,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    async with _user_lock(session_key):
+    async with _hold_user_lock(session_key):
         msg = await update.message.reply_text("Downloading...")
         file_path, embedding_dir = _new_book_paths(user_id, filename, chat_id)
         processing_task: asyncio.Task[BookKnowledgeBase | None] | None = None
