@@ -24,7 +24,7 @@ and returns a concise answer.
 - Python
 - `python-telegram-bot`
 - `sentence-transformers`
-- `PyPDF2`
+- `pypdf`
 - `torch`
 
 ## Project Structure
@@ -35,21 +35,28 @@ and returns a concise answer.
 
 ## Setup
 
-1. Create and activate a virtual environment.
+1. Create and activate a virtual environment with Python 3.11 or 3.12.
 2. Install dependencies:
 
 ```bash
-# The lock is resolved for Python 3.11 and selects the CPU Torch wheel. The
-# PyPI extra index supplies the non-Torch packages.
+# The CPU Torch wheel only exists on the PyTorch index, so install it first;
+# every other locked dependency resolves from PyPI without index confusion.
 python -m pip install \
   --index-url https://download.pytorch.org/whl/cpu \
-  --extra-index-url https://pypi.org/simple \
-  -r requirements.lock
+  --no-deps "torch==2.14.0+cpu"
+python -m pip install -r requirements.lock
 ```
 
-`requirements.txt` is the human-maintained source constraint; regenerate
+`requirements.txt` is the human-maintained source constraint. Regenerate
 `requirements.lock` with the command recorded at its top when dependencies
-are intentionally upgraded.
+are intentionally upgraded:
+
+```bash
+uv pip compile requirements.txt --python-version 3.11 --universal \
+  --index-url https://download.pytorch.org/whl/cpu \
+  --extra-index-url https://pypi.org/simple \
+  --index-strategy unsafe-best-match --output-file requirements.lock
+```
 
 3. Create `.env` from `.env.example` and set:
 
@@ -85,6 +92,13 @@ Available commands:
   temporary status message, the bot sends the completed response as a new reply.
 - Scanned PDFs without selectable text may not work well.
 - Uploads are limited to 20 MB, PDFs to 500 pages, and extracted text to 2 million characters.
+- Book processing is time-bounded to 5 minutes and each question to 2 minutes; when a
+  bound is exceeded the user gets an error and the late result's cache is discarded.
+- The default embedding model is loaded from a pinned Hub revision; set
+  `EMBEDDING_MODEL_REVISION` to a different revision, or empty it to follow the Hub
+  default (for example when the pinned revision is not available offline).
+- Uploads and questions for the same chat session are serialized so a read cannot
+  observe a half-replaced book.
 - Each private chat and group-chat/user pair has an independent active book. Source uploads are
   removed after processing; private-chat caches remain under `embeddings/<telegram-user-id>/`,
   while group-chat caches are namespaced under `embeddings/chat-<telegram-chat-id>/`.
