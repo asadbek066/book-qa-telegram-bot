@@ -1,0 +1,14 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      # The CPU wheel only exists on the PyTorch index; Dependabot resolves
+      # against PyPI and cannot regenerate the uv-compiled lock.
+      - dependency-name: torch
