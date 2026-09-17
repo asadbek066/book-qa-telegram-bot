@@ -1,4 +1,5 @@
 import asyncio
+import os
 import tempfile
 import threading
 import time
@@ -7,9 +8,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import telegram_bot
 from telegram import User
 from telegram.ext import CommandHandler, MessageHandler
+
+import telegram_bot
 
 
 class FakeStatus:
@@ -288,7 +290,7 @@ class TelegramBotBoundaryTests(unittest.TestCase):
                         SimpleNamespace(bot=FakeBot(b"book text")),
                     )
                 )
-                await asyncio.to_thread(started.wait)
+                await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=5)
                 task.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await task
@@ -493,6 +495,219 @@ class TelegramBotBoundaryTests(unittest.TestCase):
         self.assertIn((1, 1), telegram_bot.user_books)
         self.assertIn((1, 1), telegram_bot._user_locks)
         self.assertIn((1, 1), telegram_bot._active_user_order)
+
+    def test_processing_timeout_replies_and_discards_late_result(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        class SlowKnowledgeBase(FakeKnowledgeBase):
+            def load_book(self, path, book_name=None):
+                started.set()
+                release.wait(5)
+                return super().load_book(path, book_name)
+
+        async def run():
+            with (
+                patch.object(telegram_bot, "BookKnowledgeBase", SlowKnowledgeBase),
+                patch.object(telegram_bot, "BOOK_PROCESSING_TIMEOUT_SECONDS", 0.05),
+            ):
+                update = self.update_for(101, BookDocument("book.txt"))
+                task = asyncio.create_task(
+                    telegram_bot.handle_document(
+                        update, SimpleNamespace(bot=FakeBot(b"book text"))
+                    )
+                )
+                await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=5)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not any(
+                    "took too long" in message for message in update.message.messages
+                ):
+                    await asyncio.sleep(0.02)
+                release.set()
+                await task
+                storage_root = Path(self.temp_dir.name) / "embeddings" / "101"
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and list(storage_root.iterdir()):
+                    await asyncio.sleep(0.02)
+                return update
+
+        update = asyncio.run(run())
+
+        self.assertTrue(
+            any("took too long" in message for message in update.message.messages)
+        )
+        self.assertFalse(
+            any(message.startswith("Book loaded") for message in update.message.messages)
+        )
+        self.assertEqual(telegram_bot.user_books, {})
+        storage_root = Path(self.temp_dir.name) / "embeddings" / "101"
+        self.assertEqual(list(storage_root.iterdir()), [])
+
+    def test_question_waits_for_in_flight_upload(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        class SlowKnowledgeBase(FakeKnowledgeBase):
+            def load_book(self, path, book_name=None):
+                started.set()
+                release.wait(5)
+                return super().load_book(path, book_name)
+
+        async def run():
+            with patch.object(telegram_bot, "BookKnowledgeBase", SlowKnowledgeBase):
+                upload = asyncio.create_task(
+                    telegram_bot.handle_document(
+                        self.update_for(101, BookDocument("book.txt")),
+                        SimpleNamespace(bot=FakeBot(b"book text")),
+                    )
+                )
+                await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=5)
+                question_update = self.update_for(101, text="What is private?")
+                question = asyncio.create_task(
+                    telegram_bot.handle_question(question_update, SimpleNamespace())
+                )
+                await asyncio.sleep(0.1)
+                # The read must not observe (or answer from) the previous state.
+                self.assertEqual(question_update.message.messages, [])
+                release.set()
+                await asyncio.gather(upload, question)
+                return question_update
+
+        question_update = asyncio.run(run())
+
+        self.assertTrue(
+            any(
+                "answer for What is private?" in message
+                for message in question_update.message.messages
+            )
+        )
+
+    def test_question_timeout_replies_with_error(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        class HangingKnowledgeBase(FakeKnowledgeBase):
+            def answer_question(self, question, top_k, short):
+                started.set()
+                release.wait(5)
+                return super().answer_question(question, top_k, short)
+
+        async def run():
+            with (
+                patch.object(telegram_bot, "BookKnowledgeBase", HangingKnowledgeBase),
+                patch.object(telegram_bot, "QUESTION_TIMEOUT_SECONDS", 0.05),
+            ):
+                telegram_bot.user_books[(101, 101)] = HangingKnowledgeBase("one")
+                telegram_bot.user_books[(101, 101)].documents = ["user one"]
+                update = self.update_for(101, text="What is private?")
+                task = asyncio.create_task(
+                    telegram_bot.handle_question(update, SimpleNamespace())
+                )
+                await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=5)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not any(
+                    "took too long" in message for message in update.message.messages
+                ):
+                    await asyncio.sleep(0.02)
+                release.set()
+                await task
+                return update
+
+        update = asyncio.run(run())
+
+        self.assertTrue(
+            any("took too long" in message for message in update.message.messages)
+        )
+
+    def test_cancelled_lock_waiter_does_not_leak_lock_state(self):
+        async def use_lock():
+            async with telegram_bot._hold_user_lock((101, 101)):
+                pass
+
+        async def scenario():
+            async with telegram_bot._hold_user_lock((101, 101)):
+                waiter = asyncio.create_task(use_lock())
+                await asyncio.sleep(0.05)
+                self.assertEqual(telegram_bot._user_lock_refs.get((101, 101)), 2)
+                waiter.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await waiter
+
+        asyncio.run(scenario())
+
+        self.assertNotIn((101, 101), telegram_bot._user_lock_refs)
+        self.assertNotIn((101, 101), telegram_bot._user_locks)
+
+    def test_request_tracking_keeps_recently_active_sessions(self):
+        with patch.object(telegram_bot, "MAX_TRACKED_SESSIONS", 2):
+            self.assertTrue(telegram_bot._allow_request((1, 1), "question", 1))
+            self.assertTrue(telegram_bot._allow_request((2, 2), "question", 1))
+            telegram_bot._allow_request((1, 1), "question", 1)
+            self.assertTrue(telegram_bot._allow_request((3, 3), "question", 1))
+
+        self.assertIn((1, 1), telegram_bot._request_history)
+        self.assertNotIn((2, 2), telegram_bot._request_history)
+
+    def test_cache_restore_runs_off_the_event_loop(self):
+        loop_thread = threading.get_ident()
+        observed: dict[str, int] = {}
+        real_find = telegram_bot._find_persisted_book
+
+        def recording_find(session_key):
+            observed["thread"] = threading.get_ident()
+            return real_find(session_key)
+
+        async def run():
+            with patch.object(telegram_bot, "_find_persisted_book", recording_find):
+                await telegram_bot._get_kb_async((404, 404))
+
+        asyncio.run(run())
+
+        self.assertIn("thread", observed)
+        self.assertNotEqual(observed["thread"], loop_thread)
+
+    def test_summary_restores_and_reports_the_sessions_book(self):
+        class RestoringKnowledgeBase(FakeKnowledgeBase):
+            def load_embeddings(self):
+                self.book_name = "restored"
+                self.documents = ["restored document"]
+                self.embeddings = object()
+                return True
+
+            def get_book_summary(self):
+                return f"Book: {self.book_name}\nChunks: {len(self.documents)}"
+
+        storage_dir = Path(self.temp_dir.name) / "embeddings" / "303" / "upload-id"
+        storage_dir.mkdir(parents=True)
+        update = self.update_for(303, text="/summary")
+
+        with patch.object(telegram_bot, "BookKnowledgeBase", RestoringKnowledgeBase):
+            asyncio.run(telegram_bot.summary(update, SimpleNamespace()))
+
+        self.assertEqual(update.message.messages, ["Book: restored\nChunks: 1"])
+        self.assertEqual(telegram_bot._user_storage_dirs[(303, 303)], storage_dir)
+
+    def test_failure_logging_includes_bounded_detail_and_redacts_token(self):
+        secret = "123456:secret-bot-token"
+        with (
+            patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": secret}),
+            self.assertLogs("telegram_bot", level="ERROR") as captured,
+        ):
+            telegram_bot._log_failure(
+                "reply",
+                RuntimeError(
+                    f"request failed for https://api.telegram.org/bot{secret}/x"
+                ),
+            )
+        output = "\n".join(captured.output)
+        self.assertIn("RuntimeError", output)
+        self.assertIn("request failed", output)
+        self.assertNotIn(secret, output)
+
+        with self.assertLogs("telegram_bot", level="ERROR") as captured:
+            telegram_bot._log_failure("reply", RuntimeError("x" * 1_000))
+        self.assertIn("...", captured.output[0])
+        self.assertNotIn("x" * 400, captured.output[0])
 
 
 class TelegramBotApplicationBuilderTests(unittest.TestCase):
