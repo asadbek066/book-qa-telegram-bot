@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import PyPDF2
+import pypdf
 import torch
 from sentence_transformers import SentenceTransformer, util
 
@@ -23,9 +23,27 @@ CACHE_FORMAT_VERSION = 1
 MAX_BOOK_NAME_LENGTH = 128
 MAX_DOCUMENT_CACHE_BYTES = MAX_TEXT_CHARACTERS * 4 + 64 * 1024
 MAX_EMBEDDINGS_CACHE_BYTES = 64 * 1024 * 1024
+DEFAULT_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+# Pin the Hub revision of the shared default embedding model so a compromised
+# or re-tagged upstream repository cannot swap the weights this bot loads.
+# Read lazily so the EMBEDDING_MODEL_REVISION override from .env applies; an
+# empty value follows the Hub default (for example when the pinned revision is
+# unavailable offline).
+DEFAULT_EMBEDDING_MODEL_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
 
 _MODEL_CACHE: dict[str, SentenceTransformer] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
+
+
+def _embedding_model_revision(model_name: str) -> str | None:
+    if model_name != DEFAULT_EMBEDDING_MODEL:
+        return None
+    return (
+        os.getenv(
+            "EMBEDDING_MODEL_REVISION", DEFAULT_EMBEDDING_MODEL_REVISION
+        ).strip()
+        or None
+    )
 
 
 def _get_embedding_model(model_name: str) -> SentenceTransformer:
@@ -33,7 +51,11 @@ def _get_embedding_model(model_name: str) -> SentenceTransformer:
     with _MODEL_CACHE_LOCK:
         model = _MODEL_CACHE.get(model_name)
         if model is None:
-            model = SentenceTransformer(model_name)
+            model = SentenceTransformer(
+                model_name,
+                revision=_embedding_model_revision(model_name),
+                trust_remote_code=False,
+            )
             _MODEL_CACHE[model_name] = model
         return model
 
@@ -58,7 +80,7 @@ def _atomic_write(path: Path, mode: str, writer: Callable[[Any], None]) -> None:
 class BookKnowledgeBase:
     def __init__(
         self,
-        model_name: str = "all-MiniLM-L6-v2",
+        model_name: str = DEFAULT_EMBEDDING_MODEL,
         model: Any | None = None,
         storage_dir: str | Path = "embeddings",
     ):
@@ -79,7 +101,7 @@ class BookKnowledgeBase:
     def extract_text_from_pdf(self, pdf_path: str | Path) -> str:
         try:
             with Path(pdf_path).open("rb") as file:
-                pdf_reader = PyPDF2.PdfReader(file)
+                pdf_reader = pypdf.PdfReader(file)
                 page_count = len(pdf_reader.pages)
                 if page_count > MAX_PDF_PAGES:
                     logger.warning("PDF rejected: page limit exceeded")
@@ -274,8 +296,10 @@ class BookKnowledgeBase:
                 return False
 
             with np.errstate(over="ignore", invalid="ignore"):
-                embedding_values = np.array(
-                    embedding_array, dtype=np.float32, copy=True, order="C"
+                # No copy in the common case: a cache round-tripped through
+                # np.save/np.load is already float32 and C-contiguous.
+                embedding_values = np.asarray(embedding_array).astype(
+                    np.float32, order="C", copy=False
                 )
             # A finite float64 cache value can overflow while being converted to
             # float32. Reject the converted representation before similarity

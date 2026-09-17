@@ -38,6 +38,10 @@ RATE_LIMIT_WINDOW_SECONDS = 60.0
 MAX_UPLOADS_PER_WINDOW = 5
 MAX_QUESTIONS_PER_WINDOW = 30
 MAX_CONCURRENT_UPDATES = 16
+BOOK_PROCESSING_TIMEOUT_SECONDS = 300.0
+QUESTION_TIMEOUT_SECONDS = 120.0
+SHUTDOWN_GRACE_SECONDS = 10.0
+MAX_LOGGED_ERROR_CHARACTERS = 300
 BOOKS_DIR = Path(os.getenv("BOOKS_DIR", "books"))
 EMBEDDINGS_DIR = Path(os.getenv("EMBEDDINGS_DIR", "embeddings"))
 
@@ -51,7 +55,7 @@ _user_storage_dirs: dict[SessionKey, Path] = {}
 _user_locks: dict[SessionKey, asyncio.Lock] = {}
 _user_lock_refs: dict[SessionKey, int] = {}
 _active_user_order: OrderedDict[SessionKey, None] = OrderedDict()
-_request_history: dict[SessionKey, dict[str, deque[float]]] = {}
+_request_history: OrderedDict[SessionKey, dict[str, deque[float]]] = OrderedDict()
 
 
 def _validate_user_id(user_id: object) -> int:
@@ -113,6 +117,11 @@ async def _hold_user_lock(session_key: SessionKey):
             _user_lock_refs[session_key] = remaining
         else:
             _user_lock_refs.pop(session_key, None)
+            # A session that holds no book no longer needs a lock: dropping it
+            # keeps the registry bounded for sessions whose uploads failed.
+            # No task can be waiting here; waiters are counted by the refcount.
+            if session_key not in user_books:
+                _user_locks.pop(session_key, None)
 
 
 def _touch_active_user(session_key: SessionKey) -> None:
@@ -164,7 +173,10 @@ def _session_storage_root(base_dir: Path, session_key: SessionKey) -> Path:
     return base_dir / f"chat-{chat_id}" / str(user_id)
 
 
-def _restore_latest_book(session_key: SessionKey) -> BookKnowledgeBase | None:
+def _find_persisted_book(
+    session_key: SessionKey,
+) -> tuple[BookKnowledgeBase, Path] | None:
+    """Load the newest valid persisted cache without touching shared state."""
     user_storage_root = _session_storage_root(EMBEDDINGS_DIR, session_key)
     try:
         candidates = [
@@ -185,21 +197,48 @@ def _restore_latest_book(session_key: SessionKey) -> BookKnowledgeBase | None:
     for storage_dir in candidates[:MAX_PERSISTED_CANDIDATES]:
         knowledge_base = BookKnowledgeBase(storage_dir=storage_dir)
         if knowledge_base.load_embeddings():
-            _user_storage_dirs[session_key] = storage_dir
-            return knowledge_base
+            return knowledge_base, storage_dir
     return None
+
+
+def _install_kb(
+    session_key: SessionKey,
+    restored: tuple[BookKnowledgeBase, Path] | None,
+) -> BookKnowledgeBase:
+    _evict_active_user(session_key)
+    if restored is None:
+        knowledge_base = BookKnowledgeBase(
+            storage_dir=_session_storage_root(EMBEDDINGS_DIR, session_key)
+        )
+    else:
+        knowledge_base, storage_dir = restored
+        _user_storage_dirs[session_key] = storage_dir
+    user_books[session_key] = knowledge_base
+    _touch_active_user(session_key)
+    return knowledge_base
 
 
 def _get_kb(session_key: SessionKey) -> BookKnowledgeBase:
     if session_key not in user_books:
-        _evict_active_user(session_key)
-        user_books[session_key] = _restore_latest_book(
-            session_key
-        ) or BookKnowledgeBase(
-            storage_dir=_session_storage_root(EMBEDDINGS_DIR, session_key)
-        )
-    _touch_active_user(session_key)
+        _install_kb(session_key, _find_persisted_book(session_key))
+    else:
+        _touch_active_user(session_key)
     return user_books[session_key]
+
+
+async def _get_kb_async(session_key: SessionKey) -> BookKnowledgeBase:
+    """Resolve a session's knowledge base without blocking the event loop."""
+    knowledge_base = user_books.get(session_key)
+    if knowledge_base is not None:
+        _touch_active_user(session_key)
+        return knowledge_base
+    restored = await asyncio.to_thread(_find_persisted_book, session_key)
+    knowledge_base = user_books.get(session_key)
+    if knowledge_base is not None:
+        # An upload finished while the cache scan ran in a worker thread.
+        _touch_active_user(session_key)
+        return knowledge_base
+    return _install_kb(session_key, restored)
 
 
 def get_kb(user_id: int, chat_id: int | None = None) -> BookKnowledgeBase:
@@ -238,6 +277,10 @@ def _allow_request(session_key: SessionKey, bucket: str, limit: int) -> bool:
                 _request_history.pop(oldest_session, None)
         session_history = {}
         _request_history[session_key] = session_history
+    else:
+        # Refresh recency so an active session keeps its bucket while idle
+        # sessions are the ones evicted when the registry is full.
+        _request_history.move_to_end(session_key)
     history = session_history.setdefault(bucket, deque())
     cutoff = now - RATE_LIMIT_WINDOW_SECONDS
     while history and history[0] <= cutoff:
@@ -249,8 +292,16 @@ def _allow_request(session_key: SessionKey, bucket: str, limit: int) -> bool:
 
 
 def _log_failure(operation: str, error: Exception) -> None:
-    # Provider and filesystem exceptions can contain paths, URLs, or credentials.
-    logger.error("%s failed: %s", operation, type(error).__name__)
+    # Provider and filesystem exceptions can contain paths, URLs, or the bot
+    # token. Keep the detail bounded and redact the configured token; the log
+    # itself stays local to the bot process.
+    detail = str(error)
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if token:
+        detail = detail.replace(token, "<redacted>")
+    if len(detail) > MAX_LOGGED_ERROR_CHARACTERS:
+        detail = detail[:MAX_LOGGED_ERROR_CHARACTERS] + "..."
+    logger.error("%s failed: %s: %s", operation, type(error).__name__, detail)
 
 
 def _ensure_private_directory(path: Path) -> None:
@@ -290,7 +341,7 @@ def _process_uploaded_book(
             _remove_directory(embedding_dir)
 
 
-def _discard_cancelled_result(
+def _discard_late_result(
     task: asyncio.Future[object], embedding_dir: Path
 ) -> None:
     if task.cancelled():
@@ -302,19 +353,32 @@ def _discard_cancelled_result(
 
 
 async def _wait_for_processing(
-    task: asyncio.Task[BookKnowledgeBase | None], embedding_dir: Path
+    task: asyncio.Task[BookKnowledgeBase | None],
+    embedding_dir: Path,
+    timeout: float,
 ) -> BookKnowledgeBase | None:
     try:
-        return await asyncio.shield(task)
+        return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+    except TimeoutError:
+        # The worker thread cannot be cancelled; discard its result when it
+        # finishes instead of adopting a stale knowledge base. Raises to the
+        # handler, which reports a bounded-processing error to the user.
+        task.add_done_callback(
+            lambda completed: _discard_late_result(completed, embedding_dir)
+        )
+        raise
     except asyncio.CancelledError:
         # Let the worker finish its filesystem cleanup before propagating
-        # cancellation. A second cancellation is handled by the callback.
+        # cancellation, but never let a wedged worker block shutdown forever:
+        # the done-callback still cleans up whenever the worker returns.
         task.add_done_callback(
-            lambda completed: _discard_cancelled_result(completed, embedding_dir)
+            lambda completed: _discard_late_result(completed, embedding_dir)
         )
         processed_book: BookKnowledgeBase | None = None
         with suppress(asyncio.CancelledError, Exception):
-            processed_book = await asyncio.shield(task)
+            processed_book = await asyncio.wait_for(
+                asyncio.shield(task), timeout=SHUTDOWN_GRACE_SECONDS
+            )
         if processed_book is not None:
             _remove_directory(embedding_dir)
         raise
@@ -389,7 +453,8 @@ async def load_book(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     del context
     session_key = _session_key_for_update(update)
-    text = _get_kb(session_key).get_book_summary()
+    async with _hold_user_lock(session_key):
+        text = (await _get_kb_async(session_key)).get_book_summary()
     await update.message.reply_text(text)
 
 
@@ -448,7 +513,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     Path(filename).stem,
                 )
             )
-            kb_ref = await _wait_for_processing(processing_task, embedding_dir)
+            try:
+                kb_ref = await _wait_for_processing(
+                    processing_task,
+                    embedding_dir,
+                    BOOK_PROCESSING_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                response = (
+                    "That book took too long to process. Please try again "
+                    "with a smaller PDF or TXT file."
+                )
+                if not await _safe_edit(msg, response):
+                    await _safe_reply(update.message, response)
+                return
 
             if kb_ref is None:
                 response = "I could not process that book. Please upload a text-based PDF or TXT file."
@@ -500,29 +578,40 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    kb_ref = _get_kb(session_key)
-    if kb_ref is None or not kb_ref.documents:
-        await update.message.reply_text("No book loaded. Use /load_book")
-        return
-    _touch_active_user(session_key)
+    # Hold the session lock so a read cannot interleave with an upload that is
+    # replacing (and deleting) the same session's book and cache directory.
+    async with _hold_user_lock(session_key):
+        kb_ref = await _get_kb_async(session_key)
+        if kb_ref is None or not kb_ref.documents:
+            await update.message.reply_text("No book loaded. Use /load_book")
+            return
+        _touch_active_user(session_key)
 
-    msg = await update.message.reply_text("Searching...")
+        msg = await update.message.reply_text("Searching...")
 
-    try:
-        answer, chunks = await asyncio.to_thread(
-            kb_ref.answer_question, question, 2, True
-        )
+        try:
+            answer, chunks = await asyncio.wait_for(
+                asyncio.to_thread(kb_ref.answer_question, question, 2, True),
+                timeout=QUESTION_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            response = "That question took too long to answer. Please try again."
+            if not await _safe_edit(msg, response):
+                await _safe_reply(update.message, response)
+            return
+        except Exception as exc:  # noqa: BLE001 - model failures are user-safe
+            _log_failure("question answering", exc)
+            response = "I could not answer that question right now. Please try again."
+            if not await _safe_edit(msg, response):
+                await _safe_reply(update.message, response)
+            return
+
         response = _bounded_message(
             f"Q: {question}\n\n"
             f"A: [1] {answer}\n\n"
             "Sources (retrieved excerpts):\n"
             f"{_format_source_excerpts(chunks)}"
         )
-        if not await _safe_edit(msg, response):
-            await _safe_reply(update.message, response)
-    except Exception as exc:  # noqa: BLE001 - model failures are user-safe
-        _log_failure("question answering", exc)
-        response = "I could not answer that question right now. Please try again."
         if not await _safe_edit(msg, response):
             await _safe_reply(update.message, response)
 
