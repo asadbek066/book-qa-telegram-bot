@@ -16,10 +16,14 @@ from sentence_transformers import SentenceTransformer, util
 logger = logging.getLogger(__name__)
 
 MAX_PDF_PAGES = 500
+MAX_PDF_FILE_BYTES = 20 * 1024 * 1024
+MAX_PDF_STREAM_OUTPUT_BYTES = 2 * 1024 * 1024
+MAX_PDF_RECOVERY_INPUT_BYTES = 1 * 1024 * 1024
+MAX_PDF_XFORM_INVOCATIONS = 32
 MAX_TEXT_CHARACTERS = 2_000_000
 MAX_CHUNKS = 10_000
 MAX_EMBEDDING_DIMENSIONS = 4_096
-CACHE_FORMAT_VERSION = 1
+CACHE_FORMAT_VERSION = 2
 MAX_BOOK_NAME_LENGTH = 128
 MAX_DOCUMENT_CACHE_BYTES = MAX_TEXT_CHARACTERS * 4 + 64 * 1024
 MAX_EMBEDDINGS_CACHE_BYTES = 64 * 1024 * 1024
@@ -100,7 +104,27 @@ class BookKnowledgeBase:
 
     def extract_text_from_pdf(self, pdf_path: str | Path) -> str:
         try:
-            with Path(pdf_path).open("rb") as file:
+            path = Path(pdf_path)
+            if path.stat().st_size > MAX_PDF_FILE_BYTES:
+                logger.warning("PDF rejected: file size limit exceeded")
+                return ""
+
+            with (
+                pypdf.apply_configuration(
+                    maximum_declared_stream_length=MAX_PDF_FILE_BYTES,
+                    array_based_stream_maximum_output_length=MAX_PDF_STREAM_OUTPUT_BYTES,
+                    jbig2_maximum_output_length=MAX_PDF_STREAM_OUTPUT_BYTES,
+                    lzw_maximum_output_length=MAX_PDF_STREAM_OUTPUT_BYTES,
+                    run_length_maximum_output_length=MAX_PDF_STREAM_OUTPUT_BYTES,
+                    zlib_maximum_output_length=MAX_PDF_STREAM_OUTPUT_BYTES,
+                    zlib_maximum_recovery_input_length=MAX_PDF_RECOVERY_INPUT_BYTES,
+                    flate_maximum_row_length=MAX_PDF_STREAM_OUTPUT_BYTES,
+                    image_maximum_buffer_size=MAX_PDF_STREAM_OUTPUT_BYTES,
+                    xmp_maximum_input_length=MAX_PDF_RECOVERY_INPUT_BYTES,
+                    xform_maximum_invocations_per_extraction=MAX_PDF_XFORM_INVOCATIONS,
+                ),
+                path.open("rb") as file,
+            ):
                 pdf_reader = pypdf.PdfReader(file)
                 page_count = len(pdf_reader.pages)
                 if page_count > MAX_PDF_PAGES:
@@ -246,6 +270,7 @@ class BookKnowledgeBase:
                     {
                         "version": CACHE_FORMAT_VERSION,
                         "model_name": self.model_name,
+                        "model_revision": _embedding_model_revision(self.model_name),
                         "book_name": self.book_name,
                         "embedding_sha256": self._embedding_digest(embedding_array),
                         "documents": self.documents,
@@ -275,6 +300,10 @@ class BookKnowledgeBase:
             if payload.get("version") != CACHE_FORMAT_VERSION:
                 return False
             if payload.get("model_name") != self.model_name:
+                return False
+            if payload.get("model_revision") != _embedding_model_revision(
+                self.model_name
+            ):
                 return False
 
             documents = payload.get("documents")
