@@ -4,4 +4,4 @@ torch==2.14.0+cpu
 sentence-transformers>=2.7.0,<6
 numpy>=1.26.0,<3
 pypdf>=6.18.1,<7
-python-dotenv>=1.0.0,<2
+python-dotenv>=1.2.3,<2
