@@ -1,4 +1,6 @@
 import asyncio
+import io
+import logging
 import os
 import tempfile
 import threading
@@ -8,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import httpx
 from telegram import User
 from telegram.ext import CommandHandler, MessageHandler
 
@@ -121,6 +124,24 @@ class TelegramBotBoundaryTests(unittest.TestCase):
             effective_chat=SimpleNamespace(id=user_id if chat_id is None else chat_id),
         )
 
+    def test_httpx_info_logging_cannot_expose_telegram_bot_token(self):
+        token = "test-token-that-must-not-be-logged"
+        output = io.StringIO()
+        httpx_logger = logging.getLogger("httpx")
+        self.assertGreaterEqual(httpx_logger.getEffectiveLevel(), logging.WARNING)
+        handler = logging.StreamHandler(output)
+        httpx_logger.addHandler(handler)
+        try:
+            with httpx.Client(
+                transport=httpx.MockTransport(lambda request: httpx.Response(200))
+            ) as client:
+                client.post(f"https://api.telegram.org/bot{token}/sendMessage")
+        finally:
+            httpx_logger.removeHandler(handler)
+            handler.close()
+
+        self.assertNotIn(token, output.getvalue())
+
     def test_same_filename_is_isolated_between_users(self):
         async def run():
             for user_id in (101, 202):
@@ -139,6 +160,7 @@ class TelegramBotBoundaryTests(unittest.TestCase):
             telegram_bot._user_storage_dirs[(101, 101)],
             telegram_bot._user_storage_dirs[(202, 202)],
         )
+        self.assertEqual(list((Path(self.temp_dir.name) / "books").iterdir()), [])
         self.assertTrue(
             any(message.startswith("Book loaded: same") for message in self.messages)
         )
@@ -499,16 +521,21 @@ class TelegramBotBoundaryTests(unittest.TestCase):
     def test_processing_timeout_replies_and_discards_late_result(self):
         started = threading.Event()
         release = threading.Event()
+        finished = threading.Event()
+        slots = threading.BoundedSemaphore(1)
 
         class SlowKnowledgeBase(FakeKnowledgeBase):
             def load_book(self, path, book_name=None):
                 started.set()
                 release.wait(5)
-                return super().load_book(path, book_name)
+                result = super().load_book(path, book_name)
+                finished.set()
+                return result
 
         async def run():
             with (
                 patch.object(telegram_bot, "BookKnowledgeBase", SlowKnowledgeBase),
+                patch.object(telegram_bot, "_book_processing_slots", slots),
                 patch.object(telegram_bot, "BOOK_PROCESSING_TIMEOUT_SECONDS", 0.05),
             ):
                 update = self.update_for(101, BookDocument("book.txt"))
@@ -523,12 +550,35 @@ class TelegramBotBoundaryTests(unittest.TestCase):
                     "took too long" in message for message in update.message.messages
                 ):
                     await asyncio.sleep(0.02)
+                overloaded_update = self.update_for(
+                    202, BookDocument("other.txt")
+                )
+                await telegram_bot.handle_document(
+                    overloaded_update, SimpleNamespace(bot=FakeBot(b"other book"))
+                )
+                self.assertIn(
+                    "book processing is busy",
+                    overloaded_update.message.messages[-1].lower(),
+                )
                 release.set()
                 await task
+                await asyncio.wait_for(asyncio.to_thread(finished.wait), timeout=5)
+                deadline = time.monotonic() + 5
+                slot_released = slots.acquire(blocking=False)
+                while not slot_released and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                    slot_released = slots.acquire(blocking=False)
+                self.assertTrue(slot_released)
+                slots.release()
                 storage_root = Path(self.temp_dir.name) / "embeddings" / "101"
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline and list(storage_root.iterdir()):
                     await asyncio.sleep(0.02)
+                book_root = Path(self.temp_dir.name) / "books" / "101"
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and book_root.exists():
+                    await asyncio.sleep(0.02)
+                self.assertFalse(book_root.exists())
                 return update
 
         update = asyncio.run(run())
@@ -585,16 +635,21 @@ class TelegramBotBoundaryTests(unittest.TestCase):
     def test_question_timeout_replies_with_error(self):
         started = threading.Event()
         release = threading.Event()
+        finished = threading.Event()
+        slots = threading.BoundedSemaphore(1)
 
         class HangingKnowledgeBase(FakeKnowledgeBase):
             def answer_question(self, question, top_k, short):
                 started.set()
                 release.wait(5)
-                return super().answer_question(question, top_k, short)
+                result = super().answer_question(question, top_k, short)
+                finished.set()
+                return result
 
         async def run():
             with (
                 patch.object(telegram_bot, "BookKnowledgeBase", HangingKnowledgeBase),
+                patch.object(telegram_bot, "_question_answer_slots", slots),
                 patch.object(telegram_bot, "QUESTION_TIMEOUT_SECONDS", 0.05),
             ):
                 telegram_bot.user_books[(101, 101)] = HangingKnowledgeBase("one")
@@ -609,8 +664,28 @@ class TelegramBotBoundaryTests(unittest.TestCase):
                     "took too long" in message for message in update.message.messages
                 ):
                     await asyncio.sleep(0.02)
+                telegram_bot.user_books[(202, 202)] = HangingKnowledgeBase("two")
+                telegram_bot.user_books[(202, 202)].documents = ["user two"]
+                overloaded_update = self.update_for(
+                    202, text="What is private in the second book?"
+                )
+                await telegram_bot.handle_question(
+                    overloaded_update, SimpleNamespace()
+                )
+                self.assertIn(
+                    "question answering is busy",
+                    overloaded_update.message.messages[-1].lower(),
+                )
                 release.set()
                 await task
+                await asyncio.wait_for(asyncio.to_thread(finished.wait), timeout=5)
+                deadline = time.monotonic() + 5
+                slot_released = slots.acquire(blocking=False)
+                while not slot_released and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                    slot_released = slots.acquire(blocking=False)
+                self.assertTrue(slot_released)
+                slots.release()
                 return update
 
         update = asyncio.run(run())
