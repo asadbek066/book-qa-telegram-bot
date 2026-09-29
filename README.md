@@ -91,9 +91,12 @@ Available commands:
 - Each response is capped below Telegram's message-size limit. If Telegram cannot edit the
   temporary status message, the bot sends the completed response as a new reply.
 - Scanned PDFs without selectable text may not work well.
-- Uploads are limited to 20 MB, PDFs to 500 pages, and extracted text to 2 million characters.
+- Uploads are limited to 20 MB, PDFs to 500 pages, each decoded PDF stream to 2 MB, and
+  extracted text to 2 million characters.
 - Book processing is time-bounded to 5 minutes and each question to 2 minutes; when a
-  bound is exceeded the user gets an error and the late result's cache is discarded.
+  bound is exceeded the user gets an error and the late result's cache is discarded. At
+  most 4 book-processing jobs and 8 question-answering jobs run at once; a timed-out job
+  keeps its slot until its worker finishes, and new work is declined while all slots are full.
 - The default embedding model is loaded from a pinned Hub revision; set
   `EMBEDDING_MODEL_REVISION` to a different revision, or empty it to follow the Hub
   default (for example when the pinned revision is not available offline).
@@ -107,6 +110,7 @@ Available commands:
   their book again.
 - After a restart, the newest valid cache for that chat session is restored on its first interaction.
 - Embeddings are stored as NumPy arrays and documents as JSON. Cache writes are atomic and cache
-  contents are validated before use; legacy pickle caches are not loaded.
+  contents are validated against the embedding model revision before use; legacy pickle caches are
+  not loaded. Caches created before revision metadata was added must be rebuilt by re-uploading.
 - The bot has no owner allowlist. Keep the bot token private and treat the local `books/` and
   `embeddings/` directories as sensitive. Restrict filesystem access to the bot process.

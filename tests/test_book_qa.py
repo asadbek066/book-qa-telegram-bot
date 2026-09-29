@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,12 +14,17 @@ import book_qa
 from book_qa import (
     MAX_DOCUMENT_CACHE_BYTES,
     MAX_EMBEDDINGS_CACHE_BYTES,
+    MAX_PDF_FILE_BYTES,
+    MAX_PDF_STREAM_OUTPUT_BYTES,
+    MAX_PDF_XFORM_INVOCATIONS,
     MAX_TEXT_CHARACTERS,
     BookKnowledgeBase,
 )
 
 
-def _write_simple_pdf(path: Path, page_texts: list[str]) -> None:
+def _write_simple_pdf(
+    path: Path, page_texts: list[str], *, compress_streams: bool = False
+) -> None:
     """Write a minimal valid PDF with one Type1 text page per entry."""
     bodies: list[tuple[int, str]] = []
     page_numbers = []
@@ -47,11 +53,19 @@ def _write_simple_pdf(path: Path, page_texts: list[str]) -> None:
                 ),
             )
         )
-        stream = f"BT /F1 12 Tf 10 100 Td ({text}) Tj ET"
+        stream_data = f"BT /F1 12 Tf 10 100 Td ({text}) Tj ET".encode("latin-1")
+        filter_entry = ""
+        if compress_streams:
+            stream_data = zlib.compress(stream_data)
+            filter_entry = " /Filter /FlateDecode"
+        stream = stream_data.decode("latin-1")
         bodies.append(
             (
                 content_number,
-                f"<< /Length {len(stream)} >>\nstream\n{stream}\nendstream",
+                (
+                    f"<< /Length {len(stream_data)}{filter_entry} >>\n"
+                    f"stream\n{stream}\nendstream"
+                ),
             )
         )
     bodies.append(
@@ -94,6 +108,58 @@ class BookKnowledgeBaseTests(unittest.TestCase):
             self.assertEqual(
                 knowledge_base.extract_text_from_file(path), "extracted pdf text"
             )
+
+    def test_pdf_extraction_uses_bounded_stream_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "book.pdf"
+            _write_simple_pdf(path, ["Hello PDF world"])
+            original_apply = book_qa.pypdf.apply_configuration
+
+            with patch.object(
+                book_qa.pypdf,
+                "apply_configuration",
+                wraps=original_apply,
+            ) as apply_configuration:
+                knowledge_base = BookKnowledgeBase(model=FakeEmbeddingModel())
+                self.assertIn(
+                    "Hello PDF world", knowledge_base.extract_text_from_pdf(path)
+                )
+
+            limits = apply_configuration.call_args.kwargs
+            self.assertEqual(
+                limits["zlib_maximum_output_length"], MAX_PDF_STREAM_OUTPUT_BYTES
+            )
+            self.assertEqual(
+                limits["image_maximum_buffer_size"], MAX_PDF_STREAM_OUTPUT_BYTES
+            )
+            self.assertEqual(
+                limits["xform_maximum_invocations_per_extraction"],
+                MAX_PDF_XFORM_INVOCATIONS,
+            )
+
+    def test_pdf_stream_expansion_over_the_configured_limit_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "expanded.pdf"
+            _write_simple_pdf(
+                path,
+                ["A" * (MAX_PDF_STREAM_OUTPUT_BYTES + 1)],
+                compress_streams=True,
+            )
+            knowledge_base = BookKnowledgeBase(model=FakeEmbeddingModel())
+
+            self.assertEqual(knowledge_base.extract_text_from_pdf(path), "")
+
+    def test_oversized_pdf_is_rejected_before_parsing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "oversized.pdf"
+            with path.open("wb") as file:
+                file.truncate(MAX_PDF_FILE_BYTES + 1)
+            knowledge_base = BookKnowledgeBase(model=FakeEmbeddingModel())
+
+            with patch.object(book_qa.pypdf, "PdfReader") as pdf_reader:
+                self.assertEqual(knowledge_base.extract_text_from_pdf(path), "")
+
+            pdf_reader.assert_not_called()
 
     def test_load_and_reload_use_safe_non_pickle_cache(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -140,6 +206,26 @@ class BookKnowledgeBaseTests(unittest.TestCase):
             self.assertFalse(restored.load_embeddings())
             self.assertEqual(restored.documents, ["existing active book"])
             self.assertEqual(restored.book_name, "existing")
+
+    def test_cache_model_revision_mismatch_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "notes.txt"
+            source.write_text("alpha beta gamma", encoding="utf-8")
+
+            with patch.dict(os.environ, {"EMBEDDING_MODEL_REVISION": "revision-one"}):
+                writer = BookKnowledgeBase(
+                    model=FakeEmbeddingModel(), storage_dir=root / "cache"
+                )
+                self.assertTrue(writer.load_book(source, "notes"))
+                payload = json.loads(writer.documents_file.read_text(encoding="utf-8"))
+                self.assertEqual(payload["model_revision"], "revision-one")
+
+            with patch.dict(os.environ, {"EMBEDDING_MODEL_REVISION": "revision-two"}):
+                restored = BookKnowledgeBase(
+                    model=FakeEmbeddingModel(), storage_dir=root / "cache"
+                )
+                self.assertFalse(restored.load_embeddings())
 
     def test_cache_pair_with_mismatched_document_count_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

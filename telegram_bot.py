@@ -2,11 +2,14 @@ import asyncio
 import logging
 import os
 import shutil
+import threading
 import uuid
 from collections import OrderedDict, deque
+from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from time import monotonic
+from typing import TypeVar
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -25,6 +28,8 @@ load_dotenv()
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
+# HTTPX logs request URLs at INFO, and Telegram API URLs contain the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 MAX_BOOK_SIZE_BYTES = 20 * 1024 * 1024
@@ -38,6 +43,8 @@ RATE_LIMIT_WINDOW_SECONDS = 60.0
 MAX_UPLOADS_PER_WINDOW = 5
 MAX_QUESTIONS_PER_WINDOW = 30
 MAX_CONCURRENT_UPDATES = 16
+MAX_CONCURRENT_BOOK_PROCESSING = 4
+MAX_CONCURRENT_QUESTION_ANSWERS = 8
 BOOK_PROCESSING_TIMEOUT_SECONDS = 300.0
 QUESTION_TIMEOUT_SECONDS = 120.0
 SHUTDOWN_GRACE_SECONDS = 10.0
@@ -56,6 +63,9 @@ _user_locks: dict[SessionKey, asyncio.Lock] = {}
 _user_lock_refs: dict[SessionKey, int] = {}
 _active_user_order: OrderedDict[SessionKey, None] = OrderedDict()
 _request_history: OrderedDict[SessionKey, dict[str, deque[float]]] = OrderedDict()
+_book_processing_slots = threading.BoundedSemaphore(MAX_CONCURRENT_BOOK_PROCESSING)
+_question_answer_slots = threading.BoundedSemaphore(MAX_CONCURRENT_QUESTION_ANSWERS)
+_WorkerResult = TypeVar("_WorkerResult")
 
 
 def _validate_user_id(user_id: object) -> int:
@@ -122,6 +132,7 @@ async def _hold_user_lock(session_key: SessionKey):
             # No task can be waiting here; waiters are counted by the refcount.
             if session_key not in user_books:
                 _user_locks.pop(session_key, None)
+            _remove_empty_book_directory(session_key)
 
 
 def _touch_active_user(session_key: SessionKey) -> None:
@@ -171,6 +182,23 @@ def _session_storage_root(base_dir: Path, session_key: SessionKey) -> Path:
         # restorable. Group chats always use a distinct namespace.
         return base_dir / str(user_id)
     return base_dir / f"chat-{chat_id}" / str(user_id)
+
+
+def _remove_empty_book_directory(session_key: SessionKey) -> None:
+    """Prune temporary-upload folders once no handler can be staging a file."""
+    if _user_lock_refs.get(session_key):
+        return
+
+    session_dir = _session_storage_root(BOOKS_DIR, session_key)
+    try:
+        session_dir.rmdir()
+    except OSError:
+        return
+
+    chat_dir = session_dir.parent
+    if chat_dir != BOOKS_DIR:
+        with suppress(OSError):
+            chat_dir.rmdir()
 
 
 def _find_persisted_book(
@@ -341,6 +369,30 @@ def _process_uploaded_book(
             _remove_directory(embedding_dir)
 
 
+def _release_worker_slot(
+    task: asyncio.Future[_WorkerResult], slots: threading.BoundedSemaphore
+) -> None:
+    # A timed-out or cancelled handler may no longer await this task. Retrieve
+    # its result so a late worker exception does not become an unhandled-task
+    # warning, then release admission only after the thread really finished.
+    try:
+        with suppress(asyncio.CancelledError, Exception):
+            task.result()
+    finally:
+        slots.release()
+
+
+def _start_reserved_thread_task(
+    slots: threading.BoundedSemaphore,
+    function: Callable[..., _WorkerResult],
+    *args,
+) -> asyncio.Task[_WorkerResult]:
+    """Start work after the caller reserves a slot; keep it until completion."""
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    task.add_done_callback(lambda completed: _release_worker_slot(completed, slots))
+    return task
+
+
 def _discard_late_result(
     task: asyncio.Future[object], embedding_dir: Path
 ) -> None:
@@ -485,8 +537,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await update.message.reply_text("Downloading...")
         file_path, embedding_dir = _new_book_paths(user_id, filename, chat_id)
         processing_task: asyncio.Task[BookKnowledgeBase | None] | None = None
+        processing_slot_reserved = False
 
         try:
+            if not _book_processing_slots.acquire(blocking=False):
+                response = "Book processing is busy. Please try again shortly."
+                if not await _safe_edit(msg, response):
+                    await _safe_reply(update.message, response)
+                return
+            processing_slot_reserved = True
             _ensure_private_directory(file_path.parent)
             _ensure_private_directory(embedding_dir)
             file = await context.bot.get_file(document.file_id)
@@ -505,14 +564,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_path.chmod(0o600)
 
             await _safe_edit(msg, "Processing book...")
-            processing_task = asyncio.create_task(
-                asyncio.to_thread(
-                    _process_uploaded_book,
-                    file_path,
-                    embedding_dir,
-                    Path(filename).stem,
-                )
+            processing_task = _start_reserved_thread_task(
+                _book_processing_slots,
+                _process_uploaded_book,
+                file_path,
+                embedding_dir,
+                Path(filename).stem,
             )
+            processing_task.add_done_callback(
+                lambda _completed: _remove_empty_book_directory(session_key)
+            )
+            processing_slot_reserved = False
             try:
                 kb_ref = await _wait_for_processing(
                     processing_task,
@@ -556,6 +618,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not await _safe_edit(msg, response):
                 await _safe_reply(update.message, response)
         finally:
+            if processing_slot_reserved:
+                _book_processing_slots.release()
             if processing_task is None:
                 _remove_file(file_path)
                 _remove_directory(embedding_dir)
@@ -589,9 +653,27 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         msg = await update.message.reply_text("Searching...")
 
+        if not _question_answer_slots.acquire(blocking=False):
+            response = "Question answering is busy. Please try again shortly."
+            if not await _safe_edit(msg, response):
+                await _safe_reply(update.message, response)
+            return
+
+        try:
+            question_task = _start_reserved_thread_task(
+                _question_answer_slots,
+                kb_ref.answer_question,
+                question,
+                2,
+                True,
+            )
+        except BaseException:
+            _question_answer_slots.release()
+            raise
+
         try:
             answer, chunks = await asyncio.wait_for(
-                asyncio.to_thread(kb_ref.answer_question, question, 2, True),
+                asyncio.shield(question_task),
                 timeout=QUESTION_TIMEOUT_SECONDS,
             )
         except TimeoutError:
