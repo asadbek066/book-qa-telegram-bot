@@ -23,7 +23,17 @@ MAX_PDF_XFORM_INVOCATIONS = 32
 MAX_TEXT_CHARACTERS = 2_000_000
 MAX_CHUNKS = 10_000
 MAX_EMBEDDING_DIMENSIONS = 4_096
-CACHE_FORMAT_VERSION = 2
+# Version 3 records the chunking parameters in the cache, so caches built with
+# the older 500-word chunks (versions 1-2) are rebuilt instead of mixed in.
+CACHE_FORMAT_VERSION = 3
+# all-MiniLM-L6-v2 truncates its input at 256 word pieces, so chunks must be
+# sized to the model. With a model that exposes max_seq_length and a tokenizer
+# the chunk budget is counted in tokens (max_seq_length minus special tokens);
+# otherwise a conservative word count is used: 150 English words are roughly
+# 200 word pieces, below the 254 usable by the default model.
+FALLBACK_CHUNK_WORDS = 150
+CHUNK_OVERLAP_RATIO = 0.1
+MIN_TOKEN_CHUNK_BUDGET = 8
 MAX_BOOK_NAME_LENGTH = 128
 MAX_DOCUMENT_CACHE_BYTES = MAX_TEXT_CHARACTERS * 4 + 64 * 1024
 MAX_EMBEDDINGS_CACHE_BYTES = 64 * 1024 * 1024
@@ -164,20 +174,121 @@ class BookKnowledgeBase:
             logger.error("Book extraction failed: %s", type(exc).__name__)
             return ""
 
+    @staticmethod
+    def _token_budget(model: Any) -> tuple[int, Any] | None:
+        """Return (usable tokens, tokenizer) when the model exposes its limit."""
+        limit = getattr(model, "max_seq_length", None)
+        tokenizer = getattr(model, "tokenizer", None)
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or limit <= 0
+            or not callable(getattr(tokenizer, "tokenize", None))
+        ):
+            return None
+        special = 2
+        add_special = getattr(tokenizer, "num_special_tokens_to_add", None)
+        if callable(add_special):
+            try:
+                special = int(add_special(False))
+            except (TypeError, ValueError):
+                special = 2
+        budget = limit - special
+        if budget < MIN_TOKEN_CHUNK_BUDGET:
+            return None
+        return budget, tokenizer
+
+    def chunking_parameters(self) -> dict[str, Any]:
+        """Describe how this knowledge base chunks text; stored with the cache."""
+        token_budget = self._token_budget(self._get_model())
+        if token_budget is not None:
+            budget = token_budget[0]
+            return {
+                "unit": "tokens",
+                "chunk_size": budget,
+                "overlap": max(1, int(budget * CHUNK_OVERLAP_RATIO)),
+            }
+        return {
+            "unit": "words",
+            "chunk_size": FALLBACK_CHUNK_WORDS,
+            "overlap": int(FALLBACK_CHUNK_WORDS * CHUNK_OVERLAP_RATIO),
+        }
+
     def chunk_text(
-        self, text: str, chunk_size: int = 500, overlap: int = 50
+        self,
+        text: str,
+        chunk_size: int | None = None,
+        overlap: int | None = None,
     ) -> list[str]:
-        if chunk_size <= 0 or overlap < 0 or overlap >= chunk_size:
+        """Split text into overlapping chunks that fit the embedding model.
+
+        Explicit ``chunk_size``/``overlap`` are word counts. Without them the
+        size is derived from the model (see ``chunking_parameters``).
+        """
+        words = text.split()
+        if chunk_size is not None or overlap is not None:
+            params = {
+                "unit": "words",
+                "chunk_size": FALLBACK_CHUNK_WORDS if chunk_size is None else chunk_size,
+                "overlap": (
+                    int(FALLBACK_CHUNK_WORDS * CHUNK_OVERLAP_RATIO)
+                    if overlap is None
+                    else overlap
+                ),
+            }
+        else:
+            params = self.chunking_parameters()
+        size, overlap_size = params["chunk_size"], params["overlap"]
+        if size <= 0 or overlap_size < 0 or overlap_size >= size:
             raise ValueError("overlap must be smaller than chunk_size")
 
+        if params["unit"] == "words":
+            chunks = []
+            for i in range(0, len(words), size - overlap_size):
+                chunk = " ".join(words[i : i + size])
+                if chunk.strip():
+                    chunks.append(chunk)
+            return chunks
+
+        tokenizer = self._token_budget(self._get_model())[1]  # type: ignore[index]
+        pieces: list[str] = []
+        counts: list[int] = []
+        for word in words:
+            for piece in self._split_to_budget(word, size, tokenizer):
+                pieces.append(piece)
+                counts.append(max(1, len(tokenizer.tokenize(piece))))
+
         chunks = []
-        words = text.split()
-        step = chunk_size - overlap
-        for i in range(0, len(words), step):
-            chunk = " ".join(words[i : i + chunk_size])
-            if chunk.strip():
-                chunks.append(chunk)
+        start = 0
+        while start < len(pieces):
+            end, used = start, 0
+            while end < len(pieces) and (end == start or used + counts[end] <= size):
+                used += counts[end]
+                end += 1
+            chunks.append(" ".join(pieces[start:end]))
+            if end >= len(pieces):
+                break
+            # Step back to share about `overlap_size` tokens with the next
+            # chunk, always advancing by at least one piece.
+            next_start, shared = end, 0
+            while (
+                next_start - 1 > start
+                and shared + counts[next_start - 1] <= overlap_size
+            ):
+                next_start -= 1
+                shared += counts[next_start]
+            start = next_start
         return chunks
+
+    @classmethod
+    def _split_to_budget(cls, word: str, budget: int, tokenizer: Any) -> list[str]:
+        """Halve a single over-long word until each piece fits the budget."""
+        if len(word) < 2 or len(tokenizer.tokenize(word)) <= budget:
+            return [word]
+        middle = len(word) // 2
+        return cls._split_to_budget(
+            word[:middle], budget, tokenizer
+        ) + cls._split_to_budget(word[middle:], budget, tokenizer)
 
     def load_book(self, file_path: str | Path, book_name: str | None = None) -> bool:
         text = self.extract_text_from_file(file_path)
@@ -272,6 +383,7 @@ class BookKnowledgeBase:
                         "model_name": self.model_name,
                         "model_revision": _embedding_model_revision(self.model_name),
                         "book_name": self.book_name,
+                        "chunking": self.chunking_parameters(),
                         "embedding_sha256": self._embedding_digest(embedding_array),
                         "documents": self.documents,
                     },
@@ -304,6 +416,11 @@ class BookKnowledgeBase:
             if payload.get("model_revision") != _embedding_model_revision(
                 self.model_name
             ):
+                return False
+
+            # A cache built with different chunk sizes (for example another
+            # model limit or changed defaults) must be rebuilt, not mixed in.
+            if payload.get("chunking") != self.chunking_parameters():
                 return False
 
             documents = payload.get("documents")
