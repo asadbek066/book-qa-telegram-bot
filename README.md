@@ -123,8 +123,13 @@ Available commands:
   removed after processing; private-chat caches remain under `embeddings/<telegram-user-id>/`,
   while group-chat caches are namespaced under `embeddings/chat-<telegram-chat-id>/`.
 - Uploads are limited to 5 per session per minute and questions to 30 per session per minute.
-- The process keeps at most 32 active chat sessions' books in memory; evicted sessions can upload
-  their book again.
+- The process keeps at most 32 active chat sessions' books in memory. Eviction frees memory only:
+  the persisted cache stays on disk and is restored on the session's next interaction.
+- Disk usage is bounded: a successful upload removes that session's older caches, and then the
+  least recently used cached books (by directory mtime, refreshed on restore and on every
+  question) are deleted until at most 256 books and 2 GiB remain (`MAX_CACHED_BOOKS`,
+  `MAX_CACHE_BYTES` in `telegram_bot.py`). Caches of sessions held in memory are never pruned.
+  There is no delete-my-book command; uploading a new book replaces the old one.
 - After a restart, the newest valid cache for that chat session is restored on its first interaction.
 - Embeddings are stored as NumPy arrays and documents as JSON. Cache writes are atomic and cache
   contents are validated against the embedding model revision before use; legacy pickle caches are
