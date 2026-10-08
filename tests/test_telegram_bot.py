@@ -374,6 +374,26 @@ class TelegramBotBoundaryTests(unittest.TestCase):
         self.assertIn("Sources (retrieved excerpts):", response)
         self.assertIn("[1] private document", response)
 
+    def test_not_found_reply_has_no_answer_or_sources(self):
+        class AbstainingKnowledgeBase(FakeKnowledgeBase):
+            def answer_question(self, question, top_k, short):
+                del question, top_k, short
+                return "I could not find this in the book.", []
+
+        key = (101, 101)
+        telegram_bot.user_books[key] = AbstainingKnowledgeBase("one")
+        telegram_bot.user_books[key].documents = ["user one"]
+        update = self.update_for(101, text="Unrelated question?")
+
+        asyncio.run(telegram_bot.handle_question(update, SimpleNamespace()))
+
+        self.assertEqual(
+            update.message.messages[-1], "I could not find this in the book."
+        )
+        self.assertFalse(
+            any("Sources" in m or "A: [1]" in m for m in update.message.messages)
+        )
+
     def test_question_response_is_capped_to_telegram_message_limit(self):
         class HugeAnswerKnowledgeBase(FakeKnowledgeBase):
             def answer_question(self, question, top_k, short):

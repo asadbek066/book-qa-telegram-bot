@@ -1,7 +1,9 @@
 import hashlib
 import json
 import logging
+import math
 import os
+import re
 import tempfile
 import threading
 from collections.abc import Callable
@@ -34,6 +36,19 @@ CACHE_FORMAT_VERSION = 3
 FALLBACK_CHUNK_WORDS = 150
 CHUNK_OVERLAP_RATIO = 0.1
 MIN_TOKEN_CHUNK_BUDGET = 8
+# Questions whose best chunk scores below this cosine similarity are answered
+# with NOT_FOUND_MESSAGE instead of unrelated book text. Override with the
+# MIN_SIMILARITY_SCORE environment variable (read per question). The default is
+# deliberately conservative: for all-MiniLM-L6-v2, unrelated query/passage pairs
+# typically score near 0 (about -0.05 to 0.15) while genuine matches mostly sit
+# at 0.3-0.7, so 0.15 rejects only clearly unrelated questions. It could not be
+# calibrated against the real model here; tune it from the logged top scores.
+DEFAULT_MIN_SIMILARITY_SCORE = 0.15
+NOT_FOUND_MESSAGE = "I could not find this in the book."
+# Upper bound on sentences re-embedded to pick the best one in the top chunk,
+# so a question costs at most two encode calls (question + one sentence batch).
+MAX_SENTENCE_CANDIDATES = 64
+MAX_ANSWER_WORDS = 30
 MAX_BOOK_NAME_LENGTH = 128
 MAX_DOCUMENT_CACHE_BYTES = MAX_TEXT_CHARACTERS * 4 + 64 * 1024
 MAX_EMBEDDINGS_CACHE_BYTES = 64 * 1024 * 1024
@@ -58,6 +73,21 @@ def _embedding_model_revision(model_name: str) -> str | None:
         ).strip()
         or None
     )
+
+
+def _min_similarity_score() -> float:
+    raw = os.getenv("MIN_SIMILARITY_SCORE", "").strip()
+    if not raw:
+        return DEFAULT_MIN_SIMILARITY_SCORE
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid MIN_SIMILARITY_SCORE")
+        return DEFAULT_MIN_SIMILARITY_SCORE
+    if not math.isfinite(value):
+        logger.warning("Ignoring invalid MIN_SIMILARITY_SCORE")
+        return DEFAULT_MIN_SIMILARITY_SCORE
+    return max(-1.0, min(1.0, value))
 
 
 def _get_embedding_model(model_name: str) -> SentenceTransformer:
@@ -465,14 +495,11 @@ class BookKnowledgeBase:
             logger.error("Could not load embeddings: %s", type(exc).__name__)
             return False
 
-    def answer_question(
-        self, question: str, top_k: int = 3, short: bool = True
-    ) -> tuple[str, list[str]]:
-        if not self.documents or self.embeddings is None:
-            return "No book loaded", []
-        if not isinstance(question, str) or not question.strip():
-            return "Please ask a question", []
+    def retrieve(self, question: str, top_k: int = 3) -> tuple[list[str], float, Any]:
+        """Return the top_k chunks, the best cosine score and the question embedding.
 
+        Callers must have checked that a book is loaded and the question is text.
+        """
         try:
             result_count = max(1, min(int(top_k), len(self.documents)))
         except (TypeError, ValueError):
@@ -486,32 +513,65 @@ class BookKnowledgeBase:
             else np.asarray(cos_scores)
         )
         top_results = np.argsort(-score_array)[:result_count]
-        relevant_chunks = [self.documents[int(index)] for index in top_results]
+        top_score = float(score_array[int(top_results[0])])
+        # Log the score only, never the question text.
+        logger.debug("Top retrieval similarity: %.4f", top_score)
+        chunks = [self.documents[int(index)] for index in top_results]
+        return chunks, top_score, question_embedding
+
+    def _best_sentences(self, chunk: str, question_embedding: Any) -> str:
+        """Pick the sentence(s) of a chunk that best match the question.
+
+        Costs one extra batched encode call over at most MAX_SENTENCE_CANDIDATES
+        sentences, so a question needs at most two encode calls in total.
+        """
+        sentences = [
+            sentence.strip()
+            for sentence in re.split(r"[.!?]+", chunk)
+            if sentence.strip()
+        ]
+        if not sentences:
+            return ""
+
+        start = 0
+        candidates = sentences[:MAX_SENTENCE_CANDIDATES]
+        if len(candidates) > 1:
+            sentence_scores = util.pytorch_cos_sim(
+                question_embedding,
+                self._get_model().encode(candidates, convert_to_tensor=True),
+            )[0]
+            start = int(np.argmax(np.asarray(sentence_scores.detach().cpu())))
+
+        short_answer = ""
+        word_count = 0
+        for sentence in sentences[start:]:
+            words = sentence.split()
+            if word_count + len(words) > MAX_ANSWER_WORDS:
+                break
+            short_answer = f"{short_answer} {sentence}".strip()
+            word_count += len(words)
+
+        if not short_answer:
+            short_answer = " ".join(sentences[start].split()[:15]) + "..."
+        return short_answer
+
+    def answer_question(
+        self, question: str, top_k: int = 3, short: bool = True
+    ) -> tuple[str, list[str]]:
+        """Answer from the book, or abstain with no chunks when nothing matches."""
+        if not self.documents or self.embeddings is None:
+            return "No book loaded", []
+        if not isinstance(question, str) or not question.strip():
+            return "Please ask a question", []
+
+        relevant_chunks, top_score, question_embedding = self.retrieve(question, top_k)
+        if top_score < _min_similarity_score():
+            return NOT_FOUND_MESSAGE, []
 
         if short:
-            best_chunk = relevant_chunks[0]
-            import re
-
-            sentences = re.split(r"[.!?]+", best_chunk)
-            sentences = [sentence.strip() for sentence in sentences if sentence.strip()]
-
-            if not sentences:
+            answer = self._best_sentences(relevant_chunks[0], question_embedding)
+            if not answer:
                 return "No readable answer found", relevant_chunks
-
-            short_answer = ""
-            word_count = 0
-            for sentence in sentences:
-                words = sentence.split()
-                if word_count + len(words) <= 30:
-                    short_answer = f"{short_answer} {sentence}".strip()
-                    word_count += len(words)
-                else:
-                    break
-
-            if not short_answer:
-                short_answer = " ".join(sentences[0].split()[:15]) + "..."
-
-            answer = short_answer
         else:
             context = "\n\n".join(relevant_chunks)
             answer = f"Based on the book:\n\n{context}"

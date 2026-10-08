@@ -314,9 +314,98 @@ class RetrievalRankingTests(unittest.TestCase):
 
     def test_short_answer_comes_from_the_best_chunk(self):
         knowledge_base = _knowledge_base()
-        answer, chunks = knowledge_base.answer_question("What is photosynthesis?")
+        answer, chunks = knowledge_base.answer_question(
+            "What is photosynthesis in green plants?"
+        )
         self.assertIn("Photosynthesis", answer)
         self.assertEqual(chunks[0], BOOK_CHUNKS[1])
+
+
+class NotFoundAndSentenceTests(unittest.TestCase):
+    OFF_TOPIC = "Describe quantum entanglement experiments"
+
+    def test_off_topic_question_abstains_without_sources(self):
+        knowledge_base = _knowledge_base()
+
+        answer, chunks = knowledge_base.answer_question(self.OFF_TOPIC, top_k=3)
+
+        self.assertEqual(answer, book_qa.NOT_FOUND_MESSAGE)
+        self.assertEqual(chunks, [])
+        _, top_score, _ = knowledge_base.retrieve(self.OFF_TOPIC)
+        self.assertLess(top_score, book_qa.DEFAULT_MIN_SIMILARITY_SCORE)
+
+    def test_off_topic_long_answer_mode_also_abstains(self):
+        answer, chunks = _knowledge_base().answer_question(
+            self.OFF_TOPIC, top_k=3, short=False
+        )
+        self.assertEqual((answer, chunks), (book_qa.NOT_FOUND_MESSAGE, []))
+
+    def test_on_topic_question_is_answered(self):
+        answer, chunks = _knowledge_base().answer_question(
+            "Which treaty ended the thirty years war?"
+        )
+        self.assertNotEqual(answer, book_qa.NOT_FOUND_MESSAGE)
+        self.assertIn("Westphalia", answer)
+        self.assertEqual(chunks[0], BOOK_CHUNKS[2])
+
+    def test_threshold_boundary_answers_at_equal_and_abstains_above(self):
+        knowledge_base = _knowledge_base()
+        question = "Which treaty ended the thirty years war?"
+        _, top_score, _ = knowledge_base.retrieve(question)
+
+        with patch.dict(os.environ, {"MIN_SIMILARITY_SCORE": repr(top_score)}):
+            _, chunks = knowledge_base.answer_question(question)
+            self.assertTrue(chunks)
+        with patch.dict(os.environ, {"MIN_SIMILARITY_SCORE": repr(top_score + 1e-6)}):
+            answer, chunks = knowledge_base.answer_question(question)
+            self.assertEqual((answer, chunks), (book_qa.NOT_FOUND_MESSAGE, []))
+
+    def test_threshold_setting_defaults_and_rejects_bad_values(self):
+        for raw in ("", "abc", "nan", "inf"):
+            with patch.dict(os.environ, {"MIN_SIMILARITY_SCORE": raw}):
+                self.assertEqual(
+                    book_qa._min_similarity_score(),
+                    book_qa.DEFAULT_MIN_SIMILARITY_SCORE,
+                )
+        with patch.dict(os.environ, {"MIN_SIMILARITY_SCORE": "0.4"}):
+            self.assertEqual(book_qa._min_similarity_score(), 0.4)
+        with patch.dict(os.environ, {"MIN_SIMILARITY_SCORE": "7"}):
+            self.assertEqual(book_qa._min_similarity_score(), 1.0)
+
+    def test_top_score_is_logged_without_the_question_text(self):
+        knowledge_base = _knowledge_base()
+        with self.assertLogs("book_qa", level="DEBUG") as logs:
+            knowledge_base.answer_question(self.OFF_TOPIC)
+        output = "\n".join(logs.output)
+        self.assertIn("Top retrieval similarity", output)
+        self.assertNotIn("entanglement", output)
+
+    def test_best_matching_sentence_is_returned_not_the_first(self):
+        chunk = (
+            "The village sat beside a quiet river. Farmers grew barley and oats "
+            "there. The old bridge was rebuilt in stone after the great flood. "
+            "Children often fished near the mill."
+        )
+        model = HashingEmbeddingModel()
+        knowledge_base = _knowledge_base(model, [chunk, BOOK_CHUNKS[1]])
+
+        answer, chunks = knowledge_base.answer_question(
+            "When was the old bridge rebuilt after the flood?"
+        )
+
+        self.assertTrue(answer.startswith("The old bridge was rebuilt in stone"))
+        self.assertNotIn("Farmers", answer)
+        self.assertEqual(chunks[0], chunk)
+
+    def test_encode_calls_per_question_are_bounded(self):
+        model = HashingEmbeddingModel()
+        sentences = ". ".join(f"Sentence number {n} about topic{n}" for n in range(200))
+        knowledge_base = _knowledge_base(model, [sentences + "."])
+        model.encode_calls = 0
+
+        knowledge_base.answer_question("sentence number 7 about topic7")
+
+        self.assertLessEqual(model.encode_calls, 2)
 
 
 class BookKnowledgeBaseTests(unittest.TestCase):

@@ -688,6 +688,13 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await _safe_reply(update.message, response)
             return
 
+        if not chunks:
+            # Nothing matched well enough (or no usable question/book): reply
+            # with the message alone instead of presenting text as an answer.
+            if not await _safe_edit(msg, answer):
+                await _safe_reply(update.message, answer)
+            return
+
         response = _bounded_message(
             f"Q: {question}\n\n"
             f"A: [1] {answer}\n\n"
