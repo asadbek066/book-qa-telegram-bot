@@ -92,18 +92,22 @@ Available commands:
   temporary status message, the bot sends the completed response as a new reply.
 - Chunks are sized to the embedding model: the usable token budget is derived from the loaded
   model's `max_seq_length` and tokenizer (254 tokens for `all-MiniLM-L6-v2`) with 10% overlap,
-  falling back to 150 words when the model does not expose them. Longer chunks would be
+  falling back to 150 words when the model does not expose them. Words are tokenised in batches
+  and no single "word" may exceed 100 characters. Longer chunks would be
   silently truncated by the model. The chunking parameters are stored in the cache and a
   cache built with different parameters is rebuilt, so books uploaded before this change
   must be uploaded again.
-- Questions that do not match the book are not answered with unrelated text: if the best chunk's
-  cosine similarity is below `MIN_SIMILARITY_SCORE` (default `0.15`, read from the environment
-  on each question) the bot replies "I could not find this in the book." with no sources. The
-  default is deliberately low and was not calibrated against the real model: published
-  `all-MiniLM-L6-v2` behaviour puts unrelated pairs near 0 and genuine matches mostly at
-  0.3-0.7. Tune it for your books: run with `logging.getLogger("book_qa").setLevel(logging.DEBUG)`
-  (or lower the root level) to log each question's top similarity score (never the question
-  text), then raise the value until off-topic questions are rejected and real ones are not.
+- Abstaining on unrelated questions is opt-in. `MIN_SIMILARITY_SCORE` (read from the
+  environment on each question) defaults to `0.0`, which only rejects negative or NaN scores,
+  so in practice every question gets the best-matching text. Set it higher to make the bot
+  reply "I could not find this in the book." (with no sources) when the best chunk's cosine
+  similarity is below it. `all-MiniLM-L6-v2` is English-centric: for books or questions in
+  other languages, and for terse questions, genuine matches can score only 0.05-0.2, so a high
+  value produces false "not found" replies. Calibrate on your own books before enabling it:
+  enable debug logging (`logging.getLogger("book_qa").setLevel(logging.DEBUG)`) to log each
+  question's top similarity score (never the question text), collect scores for questions the
+  book answers and for clearly off-topic ones, and set the value between the two groups. A value
+  of 1 or more makes every question abstain (a warning is logged once).
 - On a hit the short answer is the sentence of the top chunk that best matches the question
   (followed by the sentences after it, up to 30 words). This costs one extra batched embedding
   call over at most 64 sentences, so at most two `encode` calls per question.
@@ -131,6 +135,8 @@ Available commands:
   `MAX_CACHE_BYTES` in `telegram_bot.py`). Caches of sessions held in memory are never pruned.
   There is no delete-my-book command; uploading a new book replaces the old one.
 - After a restart, the newest valid cache for that chat session is restored on its first interaction.
+  Restoring does not load the embedding model; the cache's chunking parameters are compared with
+  the model's when it is first loaded for a question, and a mismatch asks the user to re-upload.
 - Embeddings are stored as NumPy arrays and documents as JSON. Cache writes are atomic and cache
   contents are validated against the embedding model revision before use; legacy pickle caches are
   not loaded. Caches created before revision metadata was added must be rebuilt by re-uploading.

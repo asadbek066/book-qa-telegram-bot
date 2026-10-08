@@ -372,6 +372,80 @@ class TelegramBotBoundaryTests(unittest.TestCase):
         self.assertTrue(stale[1].exists())
         self.assertTrue(telegram_bot._user_storage_dirs[(101, 101)].is_dir())
 
+    def test_question_refreshes_the_cache_directory_mtime(self):
+        (directory,) = self._make_cached_books([1000])
+        old = directory.stat().st_mtime
+        key = (101, 101)
+        telegram_bot.user_books[key] = FakeKnowledgeBase("one")
+        telegram_bot.user_books[key].documents = ["user one"]
+        telegram_bot._user_storage_dirs[key] = directory
+
+        asyncio.run(
+            telegram_bot.handle_question(
+                self.update_for(101, text="Anything?"), SimpleNamespace()
+            )
+        )
+
+        self.assertGreater(directory.stat().st_mtime, old + 100)
+
+    def test_prune_does_not_delete_a_cache_that_is_being_restored(self):
+        directories = self._make_cached_books([900, 300, 200, 100])
+        oldest = directories[0]
+        entered, release = threading.Event(), threading.Event()
+
+        class SlowRestoringKnowledgeBase(FakeKnowledgeBase):
+            def load_embeddings(self):
+                entered.set()
+                release.wait(5)
+                self.documents = ["restored document"]
+                self.embeddings = object()
+                return True
+
+        result = {}
+
+        def restore():
+            with patch.object(
+                telegram_bot, "BookKnowledgeBase", SlowRestoringKnowledgeBase
+            ):
+                result["found"] = telegram_bot._find_persisted_book((1000, 1000))
+
+        thread = threading.Thread(target=restore)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            with patch.object(telegram_bot, "MAX_CACHED_BOOKS", 1):
+                telegram_bot._enforce_cache_bounds(set())
+            self.assertTrue(oldest.exists())
+            self.assertFalse(directories[1].exists())
+        finally:
+            release.set()
+            thread.join(5)
+        self.assertIsNotNone(result["found"])
+        self.assertEqual(result["found"][1], oldest)
+
+    def test_recently_modified_caches_are_not_pruned(self):
+        directories = self._make_cached_books([500, 5, 4])
+
+        with patch.object(telegram_bot, "MAX_CACHED_BOOKS", 1):
+            telegram_bot._enforce_cache_bounds(set())
+
+        self.assertEqual([d.exists() for d in directories], [False, True, True])
+
+    def test_restore_errors_are_logged_with_the_exception_type(self):
+        self._make_cached_books([500])
+
+        class BrokenKnowledgeBase(FakeKnowledgeBase):
+            def load_embeddings(self):
+                raise RuntimeError("boom")
+
+        with (
+            patch.object(telegram_bot, "BookKnowledgeBase", BrokenKnowledgeBase),
+            self.assertLogs("telegram_bot", level="ERROR") as logs,
+        ):
+            self.assertIsNone(telegram_bot._find_persisted_book((1000, 1000)))
+
+        self.assertIn("cache restore failed: RuntimeError", logs.output[0])
+
     def test_restore_marks_the_cache_recently_used(self):
         class RestoringKnowledgeBase(FakeKnowledgeBase):
             def load_embeddings(self):
