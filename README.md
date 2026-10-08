@@ -90,6 +90,12 @@ Available commands:
   are excerpt citations rather than PDF page numbers.
 - Each response is capped below Telegram's message-size limit. If Telegram cannot edit the
   temporary status message, the bot sends the completed response as a new reply.
+- Chunks are sized to the embedding model: the usable token budget is derived from the loaded
+  model's `max_seq_length` and tokenizer (254 tokens for `all-MiniLM-L6-v2`) with 10% overlap,
+  falling back to 150 words when the model does not expose them. Longer chunks would be
+  silently truncated by the model. The chunking parameters are stored in the cache and a
+  cache built with different parameters is rebuilt, so books uploaded before this change
+  must be uploaded again.
 - Scanned PDFs without selectable text may not work well.
 - Uploads are limited to 20 MB, PDFs to 500 pages, each decoded PDF stream to 2 MB, and
   extracted text to 2 million characters.

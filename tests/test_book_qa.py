@@ -97,6 +97,131 @@ class FakeEmbeddingModel:
         return torch.tensor([[1.0, 0.0] for _ in values])
 
 
+class FakeTokenizer:
+    """Splits every word into 3-character pieces, like a tiny word-piece model."""
+
+    def tokenize(self, text):
+        return [text[i : i + 3] for i in range(0, len(text), 3)]
+
+    def num_special_tokens_to_add(self, pair=False):
+        del pair
+        return 2
+
+
+class LimitedEmbeddingModel(FakeEmbeddingModel):
+    def __init__(self, max_seq_length=42):
+        self.max_seq_length = max_seq_length
+        self.tokenizer = FakeTokenizer()
+
+
+class ChunkSizingTests(unittest.TestCase):
+    @staticmethod
+    def words(count):
+        return [f"w{index:04d}" for index in range(count)]  # 5 chars, 2 tokens
+
+    def test_chunks_never_exceed_the_model_limit(self):
+        model = LimitedEmbeddingModel(max_seq_length=42)
+        knowledge_base = BookKnowledgeBase(model=model)
+        text = " ".join(self.words(300)) + " " + "x" * 500
+
+        chunks = knowledge_base.chunk_text(text)
+
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            tokens = sum(len(model.tokenizer.tokenize(w)) for w in chunk.split())
+            self.assertLessEqual(tokens + 2, model.max_seq_length)
+
+    def test_every_source_word_is_in_some_chunk(self):
+        model = LimitedEmbeddingModel()
+        knowledge_base = BookKnowledgeBase(model=model)
+        source = self.words(250)
+
+        chunks = knowledge_base.chunk_text(" ".join(source))
+
+        covered = {word for chunk in chunks for word in chunk.split()}
+        self.assertEqual(covered, set(source))
+
+    def test_overlap_follows_the_configured_ratio(self):
+        model = LimitedEmbeddingModel(max_seq_length=42)  # 40 usable, 4 overlap
+        knowledge_base = BookKnowledgeBase(model=model)
+        self.assertEqual(
+            knowledge_base.chunking_parameters(),
+            {"unit": "tokens", "chunk_size": 40, "overlap": 4},
+        )
+
+        chunks = knowledge_base.chunk_text(" ".join(self.words(120)))
+
+        for previous, following in zip(chunks, chunks[1:]):
+            # 2 words x 2 tokens = 4 shared tokens.
+            self.assertEqual(previous.split()[-2:], following.split()[:2])
+
+    def test_over_long_word_is_split_to_fit(self):
+        model = LimitedEmbeddingModel(max_seq_length=42)
+        knowledge_base = BookKnowledgeBase(model=model)
+
+        chunks = knowledge_base.chunk_text("start " + "y" * 400 + " end")
+
+        for chunk in chunks:
+            tokens = sum(len(model.tokenizer.tokenize(w)) for w in chunk.split())
+            self.assertLessEqual(tokens, 40)
+        self.assertEqual("".join(chunks).count("y"), 400)
+
+    def test_word_fallback_when_model_does_not_expose_a_limit(self):
+        knowledge_base = BookKnowledgeBase(model=FakeEmbeddingModel())
+        self.assertEqual(
+            knowledge_base.chunking_parameters(),
+            {
+                "unit": "words",
+                "chunk_size": book_qa.FALLBACK_CHUNK_WORDS,
+                "overlap": int(
+                    book_qa.FALLBACK_CHUNK_WORDS * book_qa.CHUNK_OVERLAP_RATIO
+                ),
+            },
+        )
+        chunks = knowledge_base.chunk_text(" ".join(self.words(400)))
+        self.assertTrue(
+            all(len(c.split()) <= book_qa.FALLBACK_CHUNK_WORDS for c in chunks)
+        )
+
+    def test_cache_written_with_other_chunking_is_not_reused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "notes.txt"
+            source.write_text(" ".join(self.words(100)), encoding="utf-8")
+            cache = root / "cache"
+
+            writer = BookKnowledgeBase(model=LimitedEmbeddingModel(42), storage_dir=cache)
+            self.assertTrue(writer.load_book(source, "notes"))
+            payload = json.loads((cache / "book_documents.json").read_text())
+            self.assertEqual(payload["chunking"]["chunk_size"], 40)
+
+            same = BookKnowledgeBase(model=LimitedEmbeddingModel(42), storage_dir=cache)
+            self.assertTrue(same.load_embeddings())
+
+            other_limit = BookKnowledgeBase(
+                model=LimitedEmbeddingModel(130), storage_dir=cache
+            )
+            self.assertFalse(other_limit.load_embeddings())
+            word_based = BookKnowledgeBase(model=FakeEmbeddingModel(), storage_dir=cache)
+            self.assertFalse(word_based.load_embeddings())
+
+    def test_cache_from_the_previous_format_is_not_reused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "notes.txt"
+            source.write_text("alpha beta gamma", encoding="utf-8")
+            cache = root / "cache"
+            writer = BookKnowledgeBase(model=FakeEmbeddingModel(), storage_dir=cache)
+            self.assertTrue(writer.load_book(source, "notes"))
+            payload = json.loads((cache / "book_documents.json").read_text())
+            payload["version"] = 2
+            payload.pop("chunking")
+            (cache / "book_documents.json").write_text(json.dumps(payload))
+
+            restored = BookKnowledgeBase(model=FakeEmbeddingModel(), storage_dir=cache)
+            self.assertFalse(restored.load_embeddings())
+
+
 class BookKnowledgeBaseTests(unittest.TestCase):
     def test_uppercase_pdf_extension_uses_pdf_extractor(self):
         with tempfile.TemporaryDirectory() as directory:
