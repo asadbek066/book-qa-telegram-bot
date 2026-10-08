@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import tempfile
 import unittest
 import zlib
@@ -95,6 +96,54 @@ class FakeEmbeddingModel:
         if isinstance(values, str):
             return torch.tensor([1.0, 0.0])
         return torch.tensor([[1.0, 0.0] for _ in values])
+
+
+class HashingEmbeddingModel:
+    """Deterministic bag-of-words embedder: no randomness, no network.
+
+    Each lower-cased word is hashed (md5, not Python's salted hash) into one of
+    ``dimensions`` buckets; the count vector is L2-normalised, so the cosine
+    similarity of two texts reflects their shared vocabulary.
+    """
+
+    def __init__(self, dimensions=512):
+        self.dimensions = dimensions
+        self.encode_calls = 0
+
+    def _vector(self, text):
+        vector = [0.0] * self.dimensions
+        for word in re.findall(r"[a-z0-9]+", text.lower()):
+            digest = hashlib.md5(word.encode("utf-8")).digest()
+            vector[int.from_bytes(digest[:4], "big") % self.dimensions] += 1.0
+        norm = sum(value * value for value in vector) ** 0.5
+        return [value / norm for value in vector] if norm else vector
+
+    def encode(self, values, convert_to_tensor=True):
+        del convert_to_tensor
+        self.encode_calls += 1
+        if isinstance(values, str):
+            return torch.tensor(self._vector(values))
+        return torch.tensor([self._vector(value) for value in values])
+
+
+BOOK_CHUNKS = [
+    "The lighthouse keeper polished the great brass lamp every evening before "
+    "the storm rolled in from the northern sea.",
+    "Photosynthesis converts sunlight, water and carbon dioxide into glucose "
+    "inside the chloroplasts of green plants.",
+    "The treaty of Westphalia ended the thirty years war and established the "
+    "principle of state sovereignty in Europe.",
+    "To bake sourdough bread, feed the starter, mix flour with water and salt, "
+    "then let the dough ferment overnight.",
+]
+
+
+def _knowledge_base(model=None, chunks=None):
+    model = model or HashingEmbeddingModel()
+    knowledge_base = BookKnowledgeBase(model=model)
+    knowledge_base.documents = list(chunks or BOOK_CHUNKS)
+    knowledge_base.embeddings = model.encode(knowledge_base.documents)
+    return knowledge_base
 
 
 class FakeTokenizer:
@@ -220,6 +269,54 @@ class ChunkSizingTests(unittest.TestCase):
 
             restored = BookKnowledgeBase(model=FakeEmbeddingModel(), storage_dir=cache)
             self.assertFalse(restored.load_embeddings())
+
+
+class RetrievalRankingTests(unittest.TestCase):
+    QUESTIONS = [
+        ("Who polished the brass lamp in the lighthouse?", 0),
+        ("How do plants turn sunlight and water into glucose?", 1),
+        ("Which treaty ended the thirty years war?", 2),
+        ("How long should the sourdough dough ferment?", 3),
+    ]
+
+    def test_chunk_with_the_answer_ranks_first(self):
+        knowledge_base = _knowledge_base()
+        for question, expected in self.QUESTIONS:
+            with self.subTest(question=question):
+                _, chunks = knowledge_base.answer_question(question, top_k=4)
+                self.assertEqual(chunks[0], BOOK_CHUNKS[expected])
+
+    def test_results_are_ordered_by_descending_score(self):
+        model = HashingEmbeddingModel()
+        knowledge_base = _knowledge_base(model)
+        question = "Which treaty ended the thirty years war in Europe?"
+        question_vector = model.encode(question)
+
+        _, chunks = knowledge_base.answer_question(question, top_k=4)
+
+        scores = [
+            float(torch.dot(question_vector, model.encode(chunk))) for chunk in chunks
+        ]
+        self.assertEqual(len(chunks), 4)
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        self.assertGreater(scores[0], scores[1])
+
+    def test_source_excerpts_are_the_returned_chunks(self):
+        knowledge_base = _knowledge_base()
+        _, chunks = knowledge_base.answer_question(
+            "What does the lighthouse keeper do?", top_k=2
+        )
+
+        self.assertEqual(len(chunks), 2)
+        self.assertTrue(all(chunk in BOOK_CHUNKS for chunk in chunks))
+        self.assertEqual(len(set(chunks)), 2)
+        self.assertEqual(chunks[0], BOOK_CHUNKS[0])
+
+    def test_short_answer_comes_from_the_best_chunk(self):
+        knowledge_base = _knowledge_base()
+        answer, chunks = knowledge_base.answer_question("What is photosynthesis?")
+        self.assertIn("Photosynthesis", answer)
+        self.assertEqual(chunks[0], BOOK_CHUNKS[1])
 
 
 class BookKnowledgeBaseTests(unittest.TestCase):
