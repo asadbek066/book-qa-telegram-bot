@@ -96,6 +96,17 @@ Available commands:
   silently truncated by the model. The chunking parameters are stored in the cache and a
   cache built with different parameters is rebuilt, so books uploaded before this change
   must be uploaded again.
+- Questions that do not match the book are not answered with unrelated text: if the best chunk's
+  cosine similarity is below `MIN_SIMILARITY_SCORE` (default `0.15`, read from the environment
+  on each question) the bot replies "I could not find this in the book." with no sources. The
+  default is deliberately low and was not calibrated against the real model: published
+  `all-MiniLM-L6-v2` behaviour puts unrelated pairs near 0 and genuine matches mostly at
+  0.3-0.7. Tune it for your books: run with `logging.getLogger("book_qa").setLevel(logging.DEBUG)`
+  (or lower the root level) to log each question's top similarity score (never the question
+  text), then raise the value until off-topic questions are rejected and real ones are not.
+- On a hit the short answer is the sentence of the top chunk that best matches the question
+  (followed by the sentences after it, up to 30 words). This costs one extra batched embedding
+  call over at most 64 sentences, so at most two `encode` calls per question.
 - Scanned PDFs without selectable text may not work well.
 - Uploads are limited to 20 MB, PDFs to 500 pages, each decoded PDF stream to 2 MB, and
   extracted text to 2 million characters.
