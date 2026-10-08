@@ -11,9 +11,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
+import torch
 from telegram import User
 from telegram.ext import CommandHandler, MessageHandler
 
+import book_qa
 import telegram_bot
 
 
@@ -73,9 +75,27 @@ class FakeKnowledgeBase:
         self.embeddings = object()
         return True
 
+    def load_embeddings(self):
+        return False
+
     def answer_question(self, question, top_k, short):
         del top_k, short
         return f"answer for {question}", ["private document"]
+
+
+class _TinyEmbeddingModel:
+    def encode(self, values, convert_to_tensor=True):
+        del convert_to_tensor
+        if isinstance(values, str):
+            return torch.tensor([1.0, 0.0])
+        return torch.tensor([[1.0, 0.0] for _ in values])
+
+
+class PersistingKnowledgeBase(book_qa.BookKnowledgeBase):
+    """The real knowledge base with a fake model, so caches really hit the disk."""
+
+    def __init__(self, storage_dir="embeddings"):
+        super().__init__(model=_TinyEmbeddingModel(), storage_dir=storage_dir)
 
 
 class BookDocument:
@@ -241,6 +261,131 @@ class TelegramBotBoundaryTests(unittest.TestCase):
         update = self.update_for(101, text="What was in my book?")
         asyncio.run(telegram_bot.handle_question(update, SimpleNamespace()))
         self.assertEqual(update.message.messages, ["No book loaded. Use /load_book"])
+
+    def test_evicted_session_keeps_its_cache_and_is_restored_from_disk(self):
+        async def run():
+            with (
+                patch.object(telegram_bot, "BookKnowledgeBase", PersistingKnowledgeBase),
+                patch.object(telegram_bot, "MAX_ACTIVE_USERS", 1),
+            ):
+                await telegram_bot.handle_document(
+                    self.update_for(101, BookDocument("first.txt")),
+                    SimpleNamespace(bot=FakeBot(b"alpha beta gamma")),
+                )
+                first_dir = telegram_bot._user_storage_dirs[(101, 101)]
+                await telegram_bot.handle_document(
+                    self.update_for(202, BookDocument("second.txt")),
+                    SimpleNamespace(bot=FakeBot(b"delta epsilon")),
+                )
+                self.assertNotIn((101, 101), telegram_bot.user_books)
+                self.assertTrue((first_dir / "book_documents.json").is_file())
+                self.assertTrue((first_dir / "book_embeddings.npy").is_file())
+
+                update = self.update_for(101, text="alpha")
+                await telegram_bot.handle_question(update, SimpleNamespace())
+                return first_dir, update
+
+        first_dir, update = asyncio.run(run())
+
+        restored = telegram_bot.user_books[(101, 101)]
+        self.assertEqual(restored.documents, ["alpha beta gamma"])
+        self.assertEqual(telegram_bot._user_storage_dirs[(101, 101)], first_dir)
+        self.assertEqual(first_dir.parent, Path(self.temp_dir.name) / "embeddings" / "101")
+        self.assertTrue(any("alpha" in m for m in update.message.messages))
+        # The other user's data is untouched and unreachable from this session.
+        other_user = Path(self.temp_dir.name) / "embeddings" / "202"
+        self.assertTrue(any(other_user.iterdir()))
+        self.assertNotEqual(first_dir.parent, other_user)
+
+    def test_new_upload_removes_the_sessions_older_caches(self):
+        async def run():
+            with patch.object(telegram_bot, "BookKnowledgeBase", PersistingKnowledgeBase):
+                await telegram_bot.handle_document(
+                    self.update_for(101, BookDocument("first.txt")),
+                    SimpleNamespace(bot=FakeBot(b"alpha beta gamma")),
+                )
+                stale = telegram_bot._user_storage_dirs[(101, 101)]
+                # Simulate memory eviction: the cache stays but is forgotten.
+                telegram_bot.user_books.pop((101, 101))
+                telegram_bot._user_storage_dirs.pop((101, 101))
+                await telegram_bot.handle_document(
+                    self.update_for(101, BookDocument("second.txt")),
+                    SimpleNamespace(bot=FakeBot(b"delta epsilon")),
+                )
+                return stale
+
+        stale = asyncio.run(run())
+
+        self.assertFalse(stale.exists())
+        remaining = list((Path(self.temp_dir.name) / "embeddings" / "101").iterdir())
+        self.assertEqual(remaining, [telegram_bot._user_storage_dirs[(101, 101)]])
+
+    def _make_cached_books(self, ages):
+        base = Path(self.temp_dir.name) / "embeddings"
+        directories = []
+        for index, age in enumerate(ages):
+            directory = base / str(1000 + index) / f"upload-{index}"
+            directory.mkdir(parents=True)
+            (directory / "book_documents.json").write_text("x" * 10)
+            stamp = time.time() - age
+            os.utime(directory, (stamp, stamp))
+            directories.append(directory)
+        return directories
+
+    def test_disk_bound_removes_the_least_recently_used_caches(self):
+        directories = self._make_cached_books([500, 400, 300, 200, 100])
+
+        with patch.object(telegram_bot, "MAX_CACHED_BOOKS", 3):
+            telegram_bot._enforce_cache_bounds(set())
+
+        self.assertEqual([d.exists() for d in directories], [False, False, True, True, True])
+        # Emptied user folders are removed too.
+        self.assertFalse(directories[0].parent.exists())
+
+    def test_disk_bound_by_bytes_and_protected_caches_survive(self):
+        directories = self._make_cached_books([500, 400, 300])
+
+        with patch.object(telegram_bot, "MAX_CACHE_BYTES", 10):
+            telegram_bot._enforce_cache_bounds({directories[0]})
+
+        # The oldest is protected (in memory); the next oldest goes first.
+        self.assertTrue(directories[0].exists())
+        self.assertFalse(directories[1].exists())
+        self.assertFalse(directories[2].exists())
+
+    def test_upload_enforces_the_disk_bound_without_touching_active_books(self):
+        stale = self._make_cached_books([900, 800])
+
+        async def run():
+            with (
+                patch.object(telegram_bot, "BookKnowledgeBase", PersistingKnowledgeBase),
+                patch.object(telegram_bot, "MAX_CACHED_BOOKS", 2),
+            ):
+                await telegram_bot.handle_document(
+                    self.update_for(101, BookDocument("new.txt")),
+                    SimpleNamespace(bot=FakeBot(b"alpha beta")),
+                )
+
+        asyncio.run(run())
+
+        self.assertFalse(stale[0].exists())
+        self.assertTrue(stale[1].exists())
+        self.assertTrue(telegram_bot._user_storage_dirs[(101, 101)].is_dir())
+
+    def test_restore_marks_the_cache_recently_used(self):
+        class RestoringKnowledgeBase(FakeKnowledgeBase):
+            def load_embeddings(self):
+                self.documents = ["restored document"]
+                self.embeddings = object()
+                return True
+
+        (directory,) = self._make_cached_books([1000])
+        old = directory.stat().st_mtime
+
+        with patch.object(telegram_bot, "BookKnowledgeBase", RestoringKnowledgeBase):
+            telegram_bot.get_kb(1000)
+
+        self.assertGreater(directory.stat().st_mtime, old + 100)
 
     def test_latest_valid_persisted_cache_is_restored_for_the_user(self):
         class RestoringKnowledgeBase(FakeKnowledgeBase):

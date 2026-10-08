@@ -38,6 +38,12 @@ MAX_SOURCE_EXCERPT_CHARACTERS = 600
 MAX_TELEGRAM_MESSAGE_CHARACTERS = 4_000
 MAX_ACTIVE_USERS = 32
 MAX_PERSISTED_CANDIDATES = 32
+# Disk policy for persisted embeddings. Memory eviction never deletes a cache;
+# instead, whenever a new cache is written, the least recently used cached books
+# (by directory mtime, refreshed on restore and on each question) are deleted
+# until both bounds hold. Caches of sessions held in memory are never pruned.
+MAX_CACHED_BOOKS = 256
+MAX_CACHE_BYTES = 2 * 1024**3
 MAX_TRACKED_SESSIONS = 1_024
 RATE_LIMIT_WINDOW_SECONDS = 60.0
 MAX_UPLOADS_PER_WINDOW = 5
@@ -56,7 +62,7 @@ SessionKey = tuple[int, int]
 
 # Each chat/user session gets a separate in-memory knowledge base and cache.
 # The uploaded source file is removed after processing, while the cache is retained
-# only for the current active book.
+# only for the current active book of each session (see MAX_CACHED_BOOKS).
 user_books: dict[SessionKey, BookKnowledgeBase] = {}
 _user_storage_dirs: dict[SessionKey, Path] = {}
 _user_locks: dict[SessionKey, asyncio.Lock] = {}
@@ -166,11 +172,12 @@ def _evict_active_user(exempt_session_key: SessionKey) -> None:
         if candidate is None:
             return
 
+        # Evict from memory only: the persisted cache stays on disk so the
+        # session can be restored later. Disk usage is bounded separately by
+        # _enforce_cache_bounds.
         user_books.pop(candidate, None)
         _active_user_order.pop(candidate, None)
-        previous_storage = _user_storage_dirs.pop(candidate, None)
-        if previous_storage is not None:
-            _remove_directory(previous_storage)
+        _user_storage_dirs.pop(candidate, None)
         _request_history.pop(candidate, None)
         _user_locks.pop(candidate, None)
 
@@ -182,6 +189,93 @@ def _session_storage_root(base_dir: Path, session_key: SessionKey) -> Path:
         # restorable. Group chats always use a distinct namespace.
         return base_dir / str(user_id)
     return base_dir / f"chat-{chat_id}" / str(user_id)
+
+
+def _book_cache_dirs() -> list[Path]:
+    """List every persisted book directory (one level below a user directory)."""
+
+    def subdirectories(path: Path) -> list[Path]:
+        try:
+            return [
+                child
+                for child in path.iterdir()
+                if child.is_dir() and not child.is_symlink()
+            ]
+        except OSError:
+            return []
+
+    books: list[Path] = []
+    for top in subdirectories(EMBEDDINGS_DIR):
+        if top.name.startswith("chat-"):
+            for user_dir in subdirectories(top):
+                books.extend(subdirectories(user_dir))
+        else:
+            books.extend(subdirectories(top))
+    return books
+
+
+def _directory_bytes(path: Path) -> int:
+    total = 0
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                with suppress(OSError):
+                    if entry.is_file(follow_symlinks=False):
+                        total += entry.stat(follow_symlinks=False).st_size
+    except OSError:
+        pass
+    return total
+
+
+def _enforce_cache_bounds(protected: set[Path]) -> None:
+    """Delete least-recently-used cached books beyond MAX_CACHED_BOOKS/MAX_CACHE_BYTES."""
+    entries: list[tuple[int, Path, int]] = []
+    for book_dir in _book_cache_dirs():
+        try:
+            modified = book_dir.stat().st_mtime_ns
+        except OSError:
+            continue
+        entries.append((modified, book_dir, _directory_bytes(book_dir)))
+    entries.sort(key=lambda entry: entry[0])
+
+    count = len(entries)
+    total_bytes = sum(size for _, _, size in entries)
+    for _, book_dir, size in entries:
+        if count <= MAX_CACHED_BOOKS and total_bytes <= MAX_CACHE_BYTES:
+            break
+        if book_dir in protected:
+            continue
+        _remove_directory(book_dir)
+        count -= 1
+        total_bytes -= size
+        # Drop the user/chat folders this left empty.
+        for parent in (book_dir.parent, book_dir.parent.parent):
+            if parent != EMBEDDINGS_DIR:
+                with suppress(OSError):
+                    parent.rmdir()
+
+
+def _prune_session_caches(session_key: SessionKey, keep: Path) -> None:
+    """Remove a session's older caches once its new book is committed."""
+    session_root = _session_storage_root(EMBEDDINGS_DIR, session_key)
+    try:
+        siblings = [
+            path
+            for path in session_root.iterdir()
+            if path.is_dir() and not path.is_symlink() and path != keep
+        ]
+    except OSError:
+        return
+    for sibling in siblings:
+        _remove_directory(sibling)
+
+
+def _touch_storage(session_key: SessionKey) -> None:
+    """Mark a session's cache as recently used for the LRU disk policy."""
+    storage_dir = _user_storage_dirs.get(session_key)
+    if storage_dir is not None:
+        with suppress(OSError):
+            os.utime(storage_dir)
 
 
 def _remove_empty_book_directory(session_key: SessionKey) -> None:
@@ -225,6 +319,8 @@ def _find_persisted_book(
     for storage_dir in candidates[:MAX_PERSISTED_CANDIDATES]:
         knowledge_base = BookKnowledgeBase(storage_dir=storage_dir)
         if knowledge_base.load_embeddings():
+            with suppress(OSError):
+                os.utime(storage_dir)
             return knowledge_base, storage_dir
     return None
 
@@ -604,6 +700,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _touch_active_user(session_key)
             if previous_storage and previous_storage != embedding_dir:
                 _remove_directory(previous_storage)
+            try:
+                # Older caches of this session (left behind by memory eviction)
+                # are superseded; then enforce the global disk bound.
+                await asyncio.to_thread(
+                    _prune_session_caches, session_key, embedding_dir
+                )
+                await asyncio.to_thread(
+                    _enforce_cache_bounds,
+                    {embedding_dir, *_user_storage_dirs.values()},
+                )
+            except Exception as exc:  # noqa: BLE001 - housekeeping must not fail the upload
+                _log_failure("cache housekeeping", exc)
 
             response = (
                 f"Book loaded: {kb_ref.book_name}\n"
@@ -650,6 +758,7 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("No book loaded. Use /load_book")
             return
         _touch_active_user(session_key)
+        _touch_storage(session_key)
 
         msg = await update.message.reply_text("Searching...")
 
