@@ -36,15 +36,25 @@ CACHE_FORMAT_VERSION = 3
 FALLBACK_CHUNK_WORDS = 150
 CHUNK_OVERLAP_RATIO = 0.1
 MIN_TOKEN_CHUNK_BUDGET = 8
-# Questions whose best chunk scores below this cosine similarity are answered
-# with NOT_FOUND_MESSAGE instead of unrelated book text. Override with the
-# MIN_SIMILARITY_SCORE environment variable (read per question). The default is
-# deliberately conservative: for all-MiniLM-L6-v2, unrelated query/passage pairs
-# typically score near 0 (about -0.05 to 0.15) while genuine matches mostly sit
-# at 0.3-0.7, so 0.15 rejects only clearly unrelated questions. It could not be
-# calibrated against the real model here; tune it from the logged top scores.
-DEFAULT_MIN_SIMILARITY_SCORE = 0.15
+# Words are tokenised in batches (one tokenizer call per batch, not per word).
+TOKENIZE_BATCH_WORDS = 2_048
+# No piece of text counted as one "word" may exceed this many characters, even
+# if the tokenizer collapses it to a single unknown token; this keeps a long
+# base64-like blob from producing a multi-megabyte chunk.
+MAX_PIECE_CHARACTERS = 100
+# Opt-in abstention: when the best chunk's cosine similarity is not at least
+# MIN_SIMILARITY_SCORE (environment variable, read per question) the bot answers
+# NOT_FOUND_MESSAGE instead of book text. The default 0.0 effectively disables it
+# (only negative scores, and NaN, abstain): all-MiniLM-L6-v2 is English-centric,
+# so for other languages and terse questions genuine matches can score only
+# 0.05-0.2, and a false "not found" is worse than a weak answer. Calibrate on
+# your own books (see README) before raising it.
+DEFAULT_MIN_SIMILARITY_SCORE = 0.0
 NOT_FOUND_MESSAGE = "I could not find this in the book."
+STALE_CACHE_MESSAGE = (
+    "This saved book was prepared with different chunking settings and cannot "
+    "be used. Please upload it again."
+)
 # Upper bound on sentences re-embedded to pick the best one in the top chunk,
 # so a question costs at most two encode calls (question + one sentence batch).
 MAX_SENTENCE_CANDIDATES = 64
@@ -75,6 +85,15 @@ def _embedding_model_revision(model_name: str) -> str | None:
     )
 
 
+_WARNED_SETTINGS: set[str] = set()
+
+
+def _warn_once(key: str, message: str) -> None:
+    if key not in _WARNED_SETTINGS:
+        _WARNED_SETTINGS.add(key)
+        logger.warning(message)
+
+
 def _min_similarity_score() -> float:
     raw = os.getenv("MIN_SIMILARITY_SCORE", "").strip()
     if not raw:
@@ -82,11 +101,15 @@ def _min_similarity_score() -> float:
     try:
         value = float(raw)
     except ValueError:
-        logger.warning("Ignoring invalid MIN_SIMILARITY_SCORE")
-        return DEFAULT_MIN_SIMILARITY_SCORE
+        value = math.nan
     if not math.isfinite(value):
-        logger.warning("Ignoring invalid MIN_SIMILARITY_SCORE")
+        _warn_once("invalid", "Ignoring invalid MIN_SIMILARITY_SCORE; using the default")
         return DEFAULT_MIN_SIMILARITY_SCORE
+    if value >= 1.0:
+        _warn_once(
+            "high",
+            "MIN_SIMILARITY_SCORE is >= 1, so every question will get the not-found reply",
+        )
     return max(-1.0, min(1.0, value))
 
 
@@ -133,9 +156,31 @@ class BookKnowledgeBase:
         self.documents: list[str] = []
         self.embeddings: Any | None = None
         self.book_name: str | None = None
+        # Chunking parameters of a restored cache that could not yet be compared
+        # with the model's (see load_embeddings); checked on the first question.
+        self._unverified_chunking: dict[str, Any] | None = None
         self.storage_dir = Path(storage_dir)
         self.embeddings_file = self.storage_dir / "book_embeddings.npy"
         self.documents_file = self.storage_dir / "book_documents.json"
+
+    def _loaded_model(self) -> Any | None:
+        """Return the embedding model only if it is already in memory."""
+        if self._model is not None:
+            return self._model
+        with _MODEL_CACHE_LOCK:
+            return _MODEL_CACHE.get(self.model_name)
+
+    @staticmethod
+    def _chunking_is_valid(chunking: Any) -> bool:
+        return (
+            isinstance(chunking, dict)
+            and chunking.get("unit") in ("tokens", "words")
+            and all(
+                isinstance(chunking.get(key), int)
+                and not isinstance(chunking.get(key), bool)
+                for key in ("chunk_size", "overlap")
+            )
+        )
 
     def _get_model(self) -> Any:
         if self._model is None:
@@ -213,7 +258,7 @@ class BookKnowledgeBase:
             not isinstance(limit, int)
             or isinstance(limit, bool)
             or limit <= 0
-            or not callable(getattr(tokenizer, "tokenize", None))
+            or not (callable(tokenizer) or callable(getattr(tokenizer, "tokenize", None)))
         ):
             return None
         special = 2
@@ -228,9 +273,9 @@ class BookKnowledgeBase:
             return None
         return budget, tokenizer
 
-    def chunking_parameters(self) -> dict[str, Any]:
+    def chunking_parameters(self, model: Any | None = None) -> dict[str, Any]:
         """Describe how this knowledge base chunks text; stored with the cache."""
-        token_budget = self._token_budget(self._get_model())
+        token_budget = self._token_budget(model if model is not None else self._get_model())
         if token_budget is not None:
             budget = token_budget[0]
             return {
@@ -281,12 +326,7 @@ class BookKnowledgeBase:
             return chunks
 
         tokenizer = self._token_budget(self._get_model())[1]  # type: ignore[index]
-        pieces: list[str] = []
-        counts: list[int] = []
-        for word in words:
-            for piece in self._split_to_budget(word, size, tokenizer):
-                pieces.append(piece)
-                counts.append(max(1, len(tokenizer.tokenize(piece))))
+        pieces, counts = self._pieces_with_counts(words, size, tokenizer)
 
         chunks = []
         start = 0
@@ -310,11 +350,57 @@ class BookKnowledgeBase:
             start = next_start
         return chunks
 
+    @staticmethod
+    def _token_counts(tokenizer: Any, texts: list[str]) -> list[int]:
+        """Count word pieces per text with one batched tokenizer call."""
+        if callable(tokenizer):
+            encoded = tokenizer(texts, add_special_tokens=False)["input_ids"]
+            return [len(ids) for ids in encoded]
+        return [len(tokenizer.tokenize(text)) for text in texts]
+
     @classmethod
-    def _split_to_budget(cls, word: str, budget: int, tokenizer: Any) -> list[str]:
+    def _pieces_with_counts(
+        cls, words: list[str], budget: int, tokenizer: Any
+    ) -> tuple[list[str], list[int]]:
+        """Split words so each piece fits the budget; return pieces and token counts."""
+        flat: list[str] = []
+        for word in words:
+            if len(word) > MAX_PIECE_CHARACTERS:
+                flat.extend(
+                    word[i : i + MAX_PIECE_CHARACTERS]
+                    for i in range(0, len(word), MAX_PIECE_CHARACTERS)
+                )
+            else:
+                flat.append(word)
+
+        pieces: list[str] = []
+        counts: list[int] = []
+        for offset in range(0, len(flat), TOKENIZE_BATCH_WORDS):
+            batch = flat[offset : offset + TOKENIZE_BATCH_WORDS]
+            for piece, count in zip(
+                batch, cls._token_counts(tokenizer, batch), strict=True
+            ):
+                if count > budget:
+                    # Rare: re-count only the pieces that are too large.
+                    for part, part_count in cls._split_to_budget(
+                        piece, budget, tokenizer, count
+                    ):
+                        pieces.append(part)
+                        counts.append(part_count)
+                else:
+                    pieces.append(piece)
+                    counts.append(max(1, count))
+        return pieces, counts
+
+    @classmethod
+    def _split_to_budget(
+        cls, word: str, budget: int, tokenizer: Any, count: int | None = None
+    ) -> list[tuple[str, int]]:
         """Halve a single over-long word until each piece fits the budget."""
-        if len(word) < 2 or len(tokenizer.tokenize(word)) <= budget:
-            return [word]
+        if count is None:
+            count = cls._token_counts(tokenizer, [word])[0]
+        if count <= budget or len(word) < 2:
+            return [(word, max(1, count))]
         middle = len(word) // 2
         return cls._split_to_budget(
             word[:middle], budget, tokenizer
@@ -335,6 +421,7 @@ class BookKnowledgeBase:
             embeddings = self._get_model().encode(documents, convert_to_tensor=True)
             self.documents = documents
             self.embeddings = embeddings
+            self._unverified_chunking = None
             self.book_name = book_name or Path(file_path).stem
             if not self.save_embeddings():
                 self.documents = []
@@ -450,7 +537,16 @@ class BookKnowledgeBase:
 
             # A cache built with different chunk sizes (for example another
             # model limit or changed defaults) must be rebuilt, not mixed in.
-            if payload.get("chunking") != self.chunking_parameters():
+            # Restoring must not load (or download) the embedding model: when it
+            # is not in memory yet the comparison is deferred to the first
+            # question, which loads it under the question timeout.
+            cached_chunking = payload.get("chunking")
+            if not self._chunking_is_valid(cached_chunking):
+                return False
+            loaded_model = self._loaded_model()
+            if loaded_model is not None and cached_chunking != self.chunking_parameters(
+                loaded_model
+            ):
                 return False
 
             documents = payload.get("documents")
@@ -489,6 +585,9 @@ class BookKnowledgeBase:
             self.documents = documents
             self.embeddings = torch.as_tensor(embedding_values)
             self.book_name = book_name
+            self._unverified_chunking = (
+                cached_chunking if loaded_model is None else None
+            )
             logger.info("Loaded cached embeddings")
             return True
         except Exception as exc:  # noqa: BLE001 - malformed local cache is untrusted
@@ -564,8 +663,21 @@ class BookKnowledgeBase:
         if not isinstance(question, str) or not question.strip():
             return "Please ask a question", []
 
+        # Loads the model if needed (inside the caller's question timeout) and
+        # only then can a restored cache's chunking be compared with it.
+        model = self._get_model()
+        if self._unverified_chunking is not None:
+            if self._unverified_chunking != self.chunking_parameters(model):
+                self.documents = []
+                self.embeddings = None
+                self.book_name = None
+                self._unverified_chunking = None
+                return STALE_CACHE_MESSAGE, []
+            self._unverified_chunking = None
+
         relevant_chunks, top_score, question_embedding = self.retrieve(question, top_k)
-        if top_score < _min_similarity_score():
+        # `not >=` so a NaN score abstains instead of counting as a hit.
+        if not top_score >= _min_similarity_score():
             return NOT_FOUND_MESSAGE, []
 
         if short:

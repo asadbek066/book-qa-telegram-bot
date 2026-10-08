@@ -157,10 +157,34 @@ class FakeTokenizer:
         return 2
 
 
+class CountingTokenizer:
+    """Batch-callable tokenizer that counts calls; 3-character word pieces."""
+
+    def __init__(self, collapse=False):
+        self.calls = 0
+        self.tokenize_calls = 0
+        self.collapse = collapse
+
+    def tokenize(self, text):
+        self.tokenize_calls += 1
+        return [text[i : i + 3] for i in range(0, len(text), 3)]
+
+    def __call__(self, texts, add_special_tokens=False):
+        del add_special_tokens
+        self.calls += 1
+        if self.collapse:  # like an unknown-token blob: one token per text
+            return {"input_ids": [[0] for _ in texts]}
+        return {"input_ids": [[0] * -(-len(t) // 3) for t in texts]}
+
+    def num_special_tokens_to_add(self, pair=False):
+        del pair
+        return 2
+
+
 class LimitedEmbeddingModel(FakeEmbeddingModel):
-    def __init__(self, max_seq_length=42):
+    def __init__(self, max_seq_length=42, tokenizer=None):
         self.max_seq_length = max_seq_length
-        self.tokenizer = FakeTokenizer()
+        self.tokenizer = tokenizer or FakeTokenizer()
 
 
 class ChunkSizingTests(unittest.TestCase):
@@ -254,6 +278,85 @@ class ChunkSizingTests(unittest.TestCase):
             word_based = BookKnowledgeBase(model=FakeEmbeddingModel(), storage_dir=cache)
             self.assertFalse(word_based.load_embeddings())
 
+    def test_tokenizer_is_called_per_batch_not_per_word(self):
+        tokenizer = CountingTokenizer()
+        model = LimitedEmbeddingModel(42, tokenizer)
+        knowledge_base = BookKnowledgeBase(model=model)
+        words = self.words(20_000)
+
+        chunks = knowledge_base.chunk_text(" ".join(words))
+
+        self.assertEqual(tokenizer.tokenize_calls, 0)
+        self.assertLessEqual(
+            tokenizer.calls, len(words) // book_qa.TOKENIZE_BATCH_WORDS + 1
+        )
+        for chunk in chunks:
+            self.assertLessEqual(
+                sum(-(-len(w) // 3) for w in chunk.split()), 40
+            )
+
+    def test_blob_the_tokenizer_collapses_to_one_token_stays_bounded(self):
+        tokenizer = CountingTokenizer(collapse=True)
+        model = LimitedEmbeddingModel(42, tokenizer)
+        knowledge_base = BookKnowledgeBase(model=model)
+        blob = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo" * 150  # ~5 KB, no spaces
+
+        chunks = knowledge_base.chunk_text(f"intro {blob} outro")
+
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertTrue(
+                all(len(w) <= book_qa.MAX_PIECE_CHARACTERS for w in chunk.split())
+            )
+            self.assertLessEqual(len(chunk), 40 * (book_qa.MAX_PIECE_CHARACTERS + 1))
+        self.assertGreaterEqual(
+            "".join(w for c in chunks for w in c.split()).count("QUJD"), 150
+        )
+
+    def test_restore_does_not_load_the_model_and_defers_the_comparison(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "notes.txt"
+            source.write_text(" ".join(self.words(100)), encoding="utf-8")
+            cache = root / "cache"
+            writer = BookKnowledgeBase(model=LimitedEmbeddingModel(42), storage_dir=cache)
+            self.assertTrue(writer.load_book(source, "notes"))
+
+            def never_load(name):
+                raise AssertionError("restore must not load the model")
+
+            book_qa._MODEL_CACHE.clear()
+            with patch.object(book_qa, "_get_embedding_model", never_load):
+                restored = BookKnowledgeBase(storage_dir=cache)
+                self.assertTrue(restored.load_embeddings())
+            self.assertTrue(restored.documents)
+
+            # First question loads the model; the same parameters pass.
+            restored._model = LimitedEmbeddingModel(42)
+            answer, chunks = restored.answer_question("w0001")
+            self.assertNotEqual(answer, book_qa.STALE_CACHE_MESSAGE)
+            self.assertTrue(chunks)
+
+    def test_stale_parameters_found_on_first_question_invalidate_the_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "notes.txt"
+            source.write_text(" ".join(self.words(100)), encoding="utf-8")
+            cache = root / "cache"
+            writer = BookKnowledgeBase(model=LimitedEmbeddingModel(42), storage_dir=cache)
+            self.assertTrue(writer.load_book(source, "notes"))
+
+            book_qa._MODEL_CACHE.clear()
+            restored = BookKnowledgeBase(storage_dir=cache)
+            self.assertTrue(restored.load_embeddings())
+            restored._model = LimitedEmbeddingModel(130)  # different limit
+
+            answer, chunks = restored.answer_question("w0001")
+
+            self.assertEqual((answer, chunks), (book_qa.STALE_CACHE_MESSAGE, []))
+            self.assertEqual(restored.documents, [])
+            self.assertEqual(restored.answer_question("w0001")[0], "No book loaded")
+
     def test_cache_from_the_previous_format_is_not_reused(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -324,26 +427,79 @@ class RetrievalRankingTests(unittest.TestCase):
 class NotFoundAndSentenceTests(unittest.TestCase):
     OFF_TOPIC = "Describe quantum entanglement experiments"
 
-    def test_off_topic_question_abstains_without_sources(self):
+    def setUp(self):
+        book_qa._WARNED_SETTINGS.clear()
+        self.addCleanup(book_qa._WARNED_SETTINGS.clear)
+
+    @staticmethod
+    def enabled(value="0.15"):
+        return patch.dict(os.environ, {"MIN_SIMILARITY_SCORE": value})
+
+    def test_default_threshold_does_not_abstain_on_a_weak_positive_score(self):
+        self.assertEqual(book_qa.DEFAULT_MIN_SIMILARITY_SCORE, 0.0)
         knowledge_base = _knowledge_base()
+        weak = "treaty alpha beta gamma delta epsilon zeta eta theta iota"
+        with patch.dict(os.environ):
+            os.environ.pop("MIN_SIMILARITY_SCORE", None)
+            _, top_score, _ = knowledge_base.retrieve(weak)
+            self.assertTrue(0.0 < top_score < 0.15)
 
-        answer, chunks = knowledge_base.answer_question(self.OFF_TOPIC, top_k=3)
+            answer, chunks = knowledge_base.answer_question(weak)
 
+        self.assertNotEqual(answer, book_qa.NOT_FOUND_MESSAGE)
+        self.assertTrue(chunks)
+
+    def test_default_threshold_abstains_on_a_negative_score(self):
+        knowledge_base = _knowledge_base()
+        negative = (["x"], -0.2, torch.tensor([1.0]))
+        with patch.object(knowledge_base, "retrieve", return_value=negative):
+            answer, chunks = knowledge_base.answer_question("anything")
+        self.assertEqual((answer, chunks), (book_qa.NOT_FOUND_MESSAGE, []))
+
+    def test_nan_score_abstains(self):
+        knowledge_base = _knowledge_base()
+        nan = (["x"], float("nan"), torch.tensor([1.0]))
+        for setting in ("0.0", "-1"):
+            with self.enabled(setting), patch.object(
+                knowledge_base, "retrieve", return_value=nan
+            ):
+                answer, chunks = knowledge_base.answer_question("anything")
+            self.assertEqual((answer, chunks), (book_qa.NOT_FOUND_MESSAGE, []))
+
+    def test_explicit_threshold_abstains_off_topic_without_sources(self):
+        knowledge_base = _knowledge_base()
+        with self.enabled():
+            answer, chunks = knowledge_base.answer_question(self.OFF_TOPIC, top_k=3)
         self.assertEqual(answer, book_qa.NOT_FOUND_MESSAGE)
         self.assertEqual(chunks, [])
         _, top_score, _ = knowledge_base.retrieve(self.OFF_TOPIC)
-        self.assertLess(top_score, book_qa.DEFAULT_MIN_SIMILARITY_SCORE)
+        self.assertLess(top_score, 0.15)
 
     def test_off_topic_long_answer_mode_also_abstains(self):
-        answer, chunks = _knowledge_base().answer_question(
-            self.OFF_TOPIC, top_k=3, short=False
-        )
+        with self.enabled():
+            answer, chunks = _knowledge_base().answer_question(
+                self.OFF_TOPIC, top_k=3, short=False
+            )
         self.assertEqual((answer, chunks), (book_qa.NOT_FOUND_MESSAGE, []))
 
+    def test_invalid_setting_is_logged_once_per_process(self):
+        with self.enabled("abc"), self.assertLogs("book_qa", level="WARNING") as logs:
+            for _ in range(3):
+                book_qa._min_similarity_score()
+        self.assertEqual(len(logs.output), 1)
+
+    def test_setting_of_one_or_more_warns_that_everything_abstains(self):
+        with self.enabled("1.5"), self.assertLogs("book_qa", level="WARNING") as logs:
+            self.assertEqual(book_qa._min_similarity_score(), 1.0)
+            book_qa._min_similarity_score()
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("every question", logs.output[0])
+
     def test_on_topic_question_is_answered(self):
-        answer, chunks = _knowledge_base().answer_question(
-            "Which treaty ended the thirty years war?"
-        )
+        with self.enabled():
+            answer, chunks = _knowledge_base().answer_question(
+                "Which treaty ended the thirty years war?"
+            )
         self.assertNotEqual(answer, book_qa.NOT_FOUND_MESSAGE)
         self.assertIn("Westphalia", answer)
         self.assertEqual(chunks[0], BOOK_CHUNKS[2])

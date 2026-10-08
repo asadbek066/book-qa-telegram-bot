@@ -6,9 +6,9 @@ import threading
 import uuid
 from collections import OrderedDict, deque
 from collections.abc import Callable
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, suppress
 from pathlib import Path
-from time import monotonic
+from time import monotonic, time
 from typing import TypeVar
 
 from dotenv import load_dotenv
@@ -44,6 +44,8 @@ MAX_PERSISTED_CANDIDATES = 32
 # until both bounds hold. Caches of sessions held in memory are never pruned.
 MAX_CACHED_BOOKS = 256
 MAX_CACHE_BYTES = 2 * 1024**3
+# A cache directory modified more recently than this is never pruned.
+PRUNE_GRACE_SECONDS = 60.0
 MAX_TRACKED_SESSIONS = 1_024
 RATE_LIMIT_WINDOW_SECONDS = 60.0
 MAX_UPLOADS_PER_WINDOW = 5
@@ -191,6 +193,35 @@ def _session_storage_root(base_dir: Path, session_key: SessionKey) -> Path:
     return base_dir / f"chat-{chat_id}" / str(user_id)
 
 
+# Cache directories being read by a restore. Pruning and restoring share this
+# registry under one lock, so a directory cannot be deleted mid-read.
+_restoring_dirs: dict[Path, int] = {}
+_restoring_lock = threading.Lock()
+
+
+@contextmanager
+def _restoring(storage_dir: Path):
+    with _restoring_lock:
+        _restoring_dirs[storage_dir] = _restoring_dirs.get(storage_dir, 0) + 1
+    try:
+        yield
+    finally:
+        with _restoring_lock:
+            remaining = _restoring_dirs.get(storage_dir, 0) - 1
+            if remaining > 0:
+                _restoring_dirs[storage_dir] = remaining
+            else:
+                _restoring_dirs.pop(storage_dir, None)
+
+
+def _remove_unless_restoring(book_dir: Path) -> bool:
+    with _restoring_lock:
+        if _restoring_dirs.get(book_dir):
+            return False
+        _remove_directory(book_dir)
+        return True
+
+
 def _book_cache_dirs() -> list[Path]:
     """List every persisted book directory (one level below a user directory)."""
 
@@ -229,6 +260,7 @@ def _directory_bytes(path: Path) -> int:
 
 def _enforce_cache_bounds(protected: set[Path]) -> None:
     """Delete least-recently-used cached books beyond MAX_CACHED_BOOKS/MAX_CACHE_BYTES."""
+    grace_cutoff_ns = int((time() - PRUNE_GRACE_SECONDS) * 1e9)
     entries: list[tuple[int, Path, int]] = []
     for book_dir in _book_cache_dirs():
         try:
@@ -240,12 +272,13 @@ def _enforce_cache_bounds(protected: set[Path]) -> None:
 
     count = len(entries)
     total_bytes = sum(size for _, _, size in entries)
-    for _, book_dir, size in entries:
+    for modified_ns, book_dir, size in entries:
         if count <= MAX_CACHED_BOOKS and total_bytes <= MAX_CACHE_BYTES:
             break
-        if book_dir in protected:
+        if book_dir in protected or modified_ns > grace_cutoff_ns:
             continue
-        _remove_directory(book_dir)
+        if not _remove_unless_restoring(book_dir):
+            continue
         count -= 1
         total_bytes -= size
         # Drop the user/chat folders this left empty.
@@ -317,8 +350,14 @@ def _find_persisted_book(
 
     candidates.sort(key=modification_time, reverse=True)
     for storage_dir in candidates[:MAX_PERSISTED_CANDIDATES]:
-        knowledge_base = BookKnowledgeBase(storage_dir=storage_dir)
-        if knowledge_base.load_embeddings():
+        try:
+            with _restoring(storage_dir):
+                knowledge_base = BookKnowledgeBase(storage_dir=storage_dir)
+                restored = knowledge_base.load_embeddings()
+        except Exception as exc:  # noqa: BLE001 - a bad cache must not break the session
+            _log_failure("cache restore", exc)
+            continue
+        if restored:
             with suppress(OSError):
                 os.utime(storage_dir)
             return knowledge_base, storage_dir
