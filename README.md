@@ -113,5 +113,5 @@ with [uv](https://docs.astral.sh/uv/).
   changed it runs the tests and opens a PR from a new `automation/relock-<run id>`
   branch. It never merges or force-pushes, and it skips while an earlier relock PR is
   open. PRs created with `GITHUB_TOKEN` do not trigger CI; close and reopen to run it.
-- Dependabot covers GitHub Actions and pip bumps outside the declared ranges. Those
-  PRs fail the lock-agreement check until the lock is regenerated.
+- Dependabot version-update PRs are switched off (`open-pull-requests-limit: 0`);
+  bump ranges in `requirements.txt` by hand and relock.
