@@ -10,3 +10,8 @@ __pycache__/
 books/
 embeddings/
 *.pdf
+.mypy_cache/
+.coverage
+htmlcov/
+venv/
+*.log
