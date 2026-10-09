@@ -4,8 +4,15 @@ updates:
     directory: /
     schedule:
       interval: weekly
+  # requirements.lock is compiled with uv (scripts/relock.sh), which Dependabot
+  # cannot run. With increase-if-necessary Dependabot only edits requirements.txt
+  # when a new release falls outside the declared range; in-range updates are
+  # left to the weekly relock workflow (.github/workflows/relock.yml). The CI
+  # step "Verify source requirements agree with the lock" fails any PR that
+  # raises a bound above the locked version, so those PRs need a manual relock.
   - package-ecosystem: pip
     directory: /
+    versioning-strategy: increase-if-necessary
     schedule:
       interval: weekly
     ignore:
