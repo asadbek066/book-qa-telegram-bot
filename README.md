@@ -153,9 +153,11 @@ Available commands:
   `pip --dry-run --no-index`, so install the new lock first if versions changed (see Setup),
   then run `scripts/relock.sh --check-only`.
 - **Weekly job:** `.github/workflows/relock.yml` runs every Monday (or on manual dispatch),
-  and if the lock changed it runs the tests and agreement check and opens or updates a single
-  PR on `automation/relock`. It never merges. Because that PR is created with `GITHUB_TOKEN`,
-  the normal CI workflow does not start on it automatically; close and reopen the PR to run it.
+  and if the lock changed it runs the tests and agreement check and opens a PR from a new
+  `automation/relock-<run id>` branch. It never merges, never force-pushes, and does nothing
+  while an earlier relock PR is still open, so merge or close that one first. Because the PR is
+  created with `GITHUB_TOKEN`, the normal CI workflow does not start on it automatically; close
+  and reopen the PR to run it.
 - **Dependabot** handles GitHub Actions and pip bumps that fall outside the declared range
   in `requirements.txt` (`increase-if-necessary`). Those PRs fail the lock-agreement check
   until you run `scripts/relock.sh` and push the new lock to the PR branch.
