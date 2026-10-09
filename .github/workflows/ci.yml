@@ -38,6 +38,8 @@ jobs:
           -r requirements.txt -r requirements.lock
       - name: Check installed dependencies
         run: python -m pip check
+      - name: Check Python syntax
+        run: python -m py_compile file_utils.py telegram_bot.py book_qa.py
       - name: Lint and format check
         run: |
           python -m pip install "ruff==0.16.5"
