@@ -38,9 +38,7 @@ def _write_simple_pdf(
     font_number = number
     bodies.append((1, "<< /Type /Catalog /Pages 2 0 R >>"))
     kids = " ".join(f"{object_number} 0 R" for object_number in page_numbers)
-    bodies.append(
-        (2, f"<< /Type /Pages /Kids [{kids}] /Count {len(page_texts)} >>")
-    )
+    bodies.append((2, f"<< /Type /Pages /Kids [{kids}] /Count {len(page_texts)} >>"))
     for page_number, content_number, text in zip(
         page_numbers, content_numbers, page_texts
     ):
@@ -263,7 +261,9 @@ class ChunkSizingTests(unittest.TestCase):
             source.write_text(" ".join(self.words(100)), encoding="utf-8")
             cache = root / "cache"
 
-            writer = BookKnowledgeBase(model=LimitedEmbeddingModel(42), storage_dir=cache)
+            writer = BookKnowledgeBase(
+                model=LimitedEmbeddingModel(42), storage_dir=cache
+            )
             self.assertTrue(writer.load_book(source, "notes"))
             payload = json.loads((cache / "book_documents.json").read_text())
             self.assertEqual(payload["chunking"]["chunk_size"], 40)
@@ -275,7 +275,9 @@ class ChunkSizingTests(unittest.TestCase):
                 model=LimitedEmbeddingModel(130), storage_dir=cache
             )
             self.assertFalse(other_limit.load_embeddings())
-            word_based = BookKnowledgeBase(model=FakeEmbeddingModel(), storage_dir=cache)
+            word_based = BookKnowledgeBase(
+                model=FakeEmbeddingModel(), storage_dir=cache
+            )
             self.assertFalse(word_based.load_embeddings())
 
     def test_tokenizer_is_called_per_batch_not_per_word(self):
@@ -291,9 +293,7 @@ class ChunkSizingTests(unittest.TestCase):
             tokenizer.calls, len(words) // book_qa.TOKENIZE_BATCH_WORDS + 1
         )
         for chunk in chunks:
-            self.assertLessEqual(
-                sum(-(-len(w) // 3) for w in chunk.split()), 40
-            )
+            self.assertLessEqual(sum(-(-len(w) // 3) for w in chunk.split()), 40)
 
     def test_blob_the_tokenizer_collapses_to_one_token_stays_bounded(self):
         tokenizer = CountingTokenizer(collapse=True)
@@ -319,7 +319,9 @@ class ChunkSizingTests(unittest.TestCase):
             source = root / "notes.txt"
             source.write_text(" ".join(self.words(100)), encoding="utf-8")
             cache = root / "cache"
-            writer = BookKnowledgeBase(model=LimitedEmbeddingModel(42), storage_dir=cache)
+            writer = BookKnowledgeBase(
+                model=LimitedEmbeddingModel(42), storage_dir=cache
+            )
             self.assertTrue(writer.load_book(source, "notes"))
 
             def never_load(name):
@@ -343,7 +345,9 @@ class ChunkSizingTests(unittest.TestCase):
             source = root / "notes.txt"
             source.write_text(" ".join(self.words(100)), encoding="utf-8")
             cache = root / "cache"
-            writer = BookKnowledgeBase(model=LimitedEmbeddingModel(42), storage_dir=cache)
+            writer = BookKnowledgeBase(
+                model=LimitedEmbeddingModel(42), storage_dir=cache
+            )
             self.assertTrue(writer.load_book(source, "notes"))
 
             book_qa._MODEL_CACHE.clear()
@@ -460,8 +464,9 @@ class NotFoundAndSentenceTests(unittest.TestCase):
         knowledge_base = _knowledge_base()
         nan = (["x"], float("nan"), torch.tensor([1.0]))
         for setting in ("0.0", "-1"):
-            with self.enabled(setting), patch.object(
-                knowledge_base, "retrieve", return_value=nan
+            with (
+                self.enabled(setting),
+                patch.object(knowledge_base, "retrieve", return_value=nan),
             ):
                 answer, chunks = knowledge_base.answer_question("anything")
             self.assertEqual((answer, chunks), (book_qa.NOT_FOUND_MESSAGE, []))

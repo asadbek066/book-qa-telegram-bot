@@ -78,9 +78,7 @@ def _embedding_model_revision(model_name: str) -> str | None:
     if model_name != DEFAULT_EMBEDDING_MODEL:
         return None
     return (
-        os.getenv(
-            "EMBEDDING_MODEL_REVISION", DEFAULT_EMBEDDING_MODEL_REVISION
-        ).strip()
+        os.getenv("EMBEDDING_MODEL_REVISION", DEFAULT_EMBEDDING_MODEL_REVISION).strip()
         or None
     )
 
@@ -103,7 +101,9 @@ def _min_similarity_score() -> float:
     except ValueError:
         value = math.nan
     if not math.isfinite(value):
-        _warn_once("invalid", "Ignoring invalid MIN_SIMILARITY_SCORE; using the default")
+        _warn_once(
+            "invalid", "Ignoring invalid MIN_SIMILARITY_SCORE; using the default"
+        )
         return DEFAULT_MIN_SIMILARITY_SCORE
     if value >= 1.0:
         _warn_once(
@@ -258,7 +258,9 @@ class BookKnowledgeBase:
             not isinstance(limit, int)
             or isinstance(limit, bool)
             or limit <= 0
-            or not (callable(tokenizer) or callable(getattr(tokenizer, "tokenize", None)))
+            or not (
+                callable(tokenizer) or callable(getattr(tokenizer, "tokenize", None))
+            )
         ):
             return None
         special = 2
@@ -275,7 +277,9 @@ class BookKnowledgeBase:
 
     def chunking_parameters(self, model: Any | None = None) -> dict[str, Any]:
         """Describe how this knowledge base chunks text; stored with the cache."""
-        token_budget = self._token_budget(model if model is not None else self._get_model())
+        token_budget = self._token_budget(
+            model if model is not None else self._get_model()
+        )
         if token_budget is not None:
             budget = token_budget[0]
             return {
@@ -304,7 +308,9 @@ class BookKnowledgeBase:
         if chunk_size is not None or overlap is not None:
             params = {
                 "unit": "words",
-                "chunk_size": FALLBACK_CHUNK_WORDS if chunk_size is None else chunk_size,
+                "chunk_size": FALLBACK_CHUNK_WORDS
+                if chunk_size is None
+                else chunk_size,
                 "overlap": (
                     int(FALLBACK_CHUNK_WORDS * CHUNK_OVERLAP_RATIO)
                     if overlap is None

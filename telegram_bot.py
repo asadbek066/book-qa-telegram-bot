@@ -154,7 +154,8 @@ def _evict_active_user(exempt_session_key: SessionKey) -> None:
             (
                 session_key
                 for session_key in _active_user_order
-                if session_key != exempt_session_key and session_key in user_books
+                if session_key != exempt_session_key
+                and session_key in user_books
                 # A session whose lock is pinned by an in-flight handler must
                 # survive: evicting it would orphan that handler's lock.
                 and not _user_lock_refs.get(session_key)
@@ -528,9 +529,7 @@ def _start_reserved_thread_task(
     return task
 
 
-def _discard_late_result(
-    task: asyncio.Future[object], embedding_dir: Path
-) -> None:
+def _discard_late_result(task: asyncio.Future[object], embedding_dir: Path) -> None:
     if task.cancelled():
         _remove_directory(embedding_dir)
         return
@@ -870,25 +869,17 @@ def _build_application(token: str) -> Application:
 
 def _install_handlers(application: Application) -> None:
     message_only = filters.UpdateType.MESSAGE
-    application.add_handler(
-        CommandHandler("start", start, filters=message_only)
-    )
-    application.add_handler(
-        CommandHandler("help", help_command, filters=message_only)
-    )
+    application.add_handler(CommandHandler("start", start, filters=message_only))
+    application.add_handler(CommandHandler("help", help_command, filters=message_only))
     application.add_handler(
         CommandHandler("load_book", load_book, filters=message_only)
     )
-    application.add_handler(
-        CommandHandler("summary", summary, filters=message_only)
-    )
+    application.add_handler(CommandHandler("summary", summary, filters=message_only))
     application.add_handler(
         MessageHandler(filters.Document.ALL & message_only, handle_document)
     )
     application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND & message_only, handle_question
-        )
+        MessageHandler(filters.TEXT & ~filters.COMMAND & message_only, handle_question)
     )
     application.add_error_handler(error_handler)
 
@@ -903,7 +894,7 @@ def main():
     application = _build_application(token)
     _install_handlers(application)
 
-    print("Bot starting...")
+    logger.info("Bot starting")
     application.run_polling()
 
 

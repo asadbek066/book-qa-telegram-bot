@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import UTC
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -265,7 +266,9 @@ class TelegramBotBoundaryTests(unittest.TestCase):
     def test_evicted_session_keeps_its_cache_and_is_restored_from_disk(self):
         async def run():
             with (
-                patch.object(telegram_bot, "BookKnowledgeBase", PersistingKnowledgeBase),
+                patch.object(
+                    telegram_bot, "BookKnowledgeBase", PersistingKnowledgeBase
+                ),
                 patch.object(telegram_bot, "MAX_ACTIVE_USERS", 1),
             ):
                 await telegram_bot.handle_document(
@@ -290,7 +293,9 @@ class TelegramBotBoundaryTests(unittest.TestCase):
         restored = telegram_bot.user_books[(101, 101)]
         self.assertEqual(restored.documents, ["alpha beta gamma"])
         self.assertEqual(telegram_bot._user_storage_dirs[(101, 101)], first_dir)
-        self.assertEqual(first_dir.parent, Path(self.temp_dir.name) / "embeddings" / "101")
+        self.assertEqual(
+            first_dir.parent, Path(self.temp_dir.name) / "embeddings" / "101"
+        )
         self.assertTrue(any("alpha" in m for m in update.message.messages))
         # The other user's data is untouched and unreachable from this session.
         other_user = Path(self.temp_dir.name) / "embeddings" / "202"
@@ -299,7 +304,9 @@ class TelegramBotBoundaryTests(unittest.TestCase):
 
     def test_new_upload_removes_the_sessions_older_caches(self):
         async def run():
-            with patch.object(telegram_bot, "BookKnowledgeBase", PersistingKnowledgeBase):
+            with patch.object(
+                telegram_bot, "BookKnowledgeBase", PersistingKnowledgeBase
+            ):
                 await telegram_bot.handle_document(
                     self.update_for(101, BookDocument("first.txt")),
                     SimpleNamespace(bot=FakeBot(b"alpha beta gamma")),
@@ -338,7 +345,9 @@ class TelegramBotBoundaryTests(unittest.TestCase):
         with patch.object(telegram_bot, "MAX_CACHED_BOOKS", 3):
             telegram_bot._enforce_cache_bounds(set())
 
-        self.assertEqual([d.exists() for d in directories], [False, False, True, True, True])
+        self.assertEqual(
+            [d.exists() for d in directories], [False, False, True, True, True]
+        )
         # Emptied user folders are removed too.
         self.assertFalse(directories[0].parent.exists())
 
@@ -358,7 +367,9 @@ class TelegramBotBoundaryTests(unittest.TestCase):
 
         async def run():
             with (
-                patch.object(telegram_bot, "BookKnowledgeBase", PersistingKnowledgeBase),
+                patch.object(
+                    telegram_bot, "BookKnowledgeBase", PersistingKnowledgeBase
+                ),
                 patch.object(telegram_bot, "MAX_CACHED_BOOKS", 2),
             ):
                 await telegram_bot.handle_document(
@@ -789,9 +800,7 @@ class TelegramBotBoundaryTests(unittest.TestCase):
                     "took too long" in message for message in update.message.messages
                 ):
                     await asyncio.sleep(0.02)
-                overloaded_update = self.update_for(
-                    202, BookDocument("other.txt")
-                )
+                overloaded_update = self.update_for(202, BookDocument("other.txt"))
                 await telegram_bot.handle_document(
                     overloaded_update, SimpleNamespace(bot=FakeBot(b"other book"))
                 )
@@ -826,7 +835,9 @@ class TelegramBotBoundaryTests(unittest.TestCase):
             any("took too long" in message for message in update.message.messages)
         )
         self.assertFalse(
-            any(message.startswith("Book loaded") for message in update.message.messages)
+            any(
+                message.startswith("Book loaded") for message in update.message.messages
+            )
         )
         self.assertEqual(telegram_bot.user_books, {})
         storage_root = Path(self.temp_dir.name) / "embeddings" / "101"
@@ -908,9 +919,7 @@ class TelegramBotBoundaryTests(unittest.TestCase):
                 overloaded_update = self.update_for(
                     202, text="What is private in the second book?"
                 )
-                await telegram_bot.handle_question(
-                    overloaded_update, SimpleNamespace()
-                )
+                await telegram_bot.handle_question(overloaded_update, SimpleNamespace())
                 self.assertIn(
                     "question answering is busy",
                     overloaded_update.message.messages[-1].lower(),
@@ -1028,9 +1037,7 @@ class TelegramBotApplicationBuilderTests(unittest.TestCase):
     def setUp(self):
         from unittest.mock import AsyncMock
 
-        bot_user = User(
-            id=123, is_bot=True, first_name="Fake", username="fakebot"
-        )
+        bot_user = User(id=123, is_bot=True, first_name="Fake", username="fakebot")
         self.patches = [
             patch("telegram.Bot.get_me", new=AsyncMock(return_value=bot_user))
         ]
@@ -1057,11 +1064,11 @@ class TelegramBotApplicationBuilderTests(unittest.TestCase):
         )
 
     def test_message_edits_and_channel_posts_never_reach_handlers(self):
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from telegram import Chat, Message, Update
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         document_edit = Update(
             update_id=1,
             edited_message=Message(
@@ -1080,7 +1087,10 @@ class TelegramBotApplicationBuilderTests(unittest.TestCase):
         command_edit = Update(
             update_id=3,
             edited_message=Message(
-                message_id=4, date=now, chat=Chat(id=1, type=Chat.PRIVATE), text="/start"
+                message_id=4,
+                date=now,
+                chat=Chat(id=1, type=Chat.PRIVATE),
+                text="/start",
             ),
         )
         for message in (
@@ -1102,11 +1112,11 @@ class TelegramBotApplicationBuilderTests(unittest.TestCase):
             self.assertFalse(handler.check_update(command_edit))
 
     def test_real_messages_still_reach_every_handler(self):
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from telegram import Chat, Message, MessageEntity, Update
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         chat = Chat(id=1, type=Chat.PRIVATE)
         document_update = Update(
             update_id=1,
@@ -1119,9 +1129,7 @@ class TelegramBotApplicationBuilderTests(unittest.TestCase):
         )
         text_update = Update(
             update_id=2,
-            message=Message(
-                message_id=3, date=now, chat=chat, text="plain question"
-            ),
+            message=Message(message_id=3, date=now, chat=chat, text="plain question"),
         )
         start_update = Update(
             update_id=3,
@@ -1130,7 +1138,9 @@ class TelegramBotApplicationBuilderTests(unittest.TestCase):
                 date=now,
                 chat=chat,
                 text="/start",
-                entities=[MessageEntity(type=MessageEntity.BOT_COMMAND, offset=0, length=6)],
+                entities=[
+                    MessageEntity(type=MessageEntity.BOT_COMMAND, offset=0, length=6)
+                ],
             ),
         )
         for message in (
@@ -1142,12 +1152,8 @@ class TelegramBotApplicationBuilderTests(unittest.TestCase):
 
         handlers = self.application.handlers[0]
         command_handlers = [h for h in handlers if isinstance(h, CommandHandler)]
-        self.assertTrue(
-            any(h.check_update(start_update) for h in command_handlers)
-        )
-        message_handlers = [
-            h for h in handlers if isinstance(h, MessageHandler)
-        ]
+        self.assertTrue(any(h.check_update(start_update) for h in command_handlers))
+        message_handlers = [h for h in handlers if isinstance(h, MessageHandler)]
         self.assertEqual(len(message_handlers), 2)
         self.assertTrue(message_handlers[0].check_update(document_update))
         self.assertTrue(message_handlers[1].check_update(text_update))
