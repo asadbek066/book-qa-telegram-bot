@@ -142,3 +142,20 @@ Available commands:
   not loaded. Caches created before revision metadata was added must be rebuilt by re-uploading.
 - The bot has no owner allowlist. Keep the bot token private and treat the local `books/` and
   `embeddings/` directories as sensitive. Restrict filesystem access to the bot process.
+
+## Updating dependencies
+
+`requirements.txt` holds the source ranges; `requirements.lock` is compiled from it with
+[uv](https://docs.astral.sh/uv/).
+
+- **Relock locally:** `scripts/relock.sh` runs the exact `uv pip compile` command (including
+  the PyTorch CPU index) and then the same agreement check CI runs. That check uses
+  `pip --dry-run --no-index`, so install the new lock first if versions changed (see Setup),
+  then run `scripts/relock.sh --check-only`.
+- **Weekly job:** `.github/workflows/relock.yml` runs every Monday (or on manual dispatch),
+  and if the lock changed it runs the tests and agreement check and opens or updates a single
+  PR on `automation/relock`. It never merges. Because that PR is created with `GITHUB_TOKEN`,
+  the normal CI workflow does not start on it automatically; close and reopen the PR to run it.
+- **Dependabot** handles GitHub Actions and pip bumps that fall outside the declared range
+  in `requirements.txt` (`increase-if-necessary`). Those PRs fail the lock-agreement check
+  until you run `scripts/relock.sh` and push the new lock to the PR branch.

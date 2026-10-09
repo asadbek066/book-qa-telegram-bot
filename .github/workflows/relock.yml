@@ -1,0 +1,109 @@
+name: Relock
+
+# Weekly refresh of requirements.lock (compiled with uv, which Dependabot cannot
+# run). Opens or updates ONE pull request on a fixed branch; never merges.
+#
+# Limitation: pull requests created with the built-in GITHUB_TOKEN do not
+# trigger pull_request workflows, so the normal CI workflow will not start on
+# the relock PR. This job therefore runs the tests and the agreement check
+# against the new lock itself and reports the result in the PR body. To get the
+# full CI matrix, close and reopen the PR (or push an empty commit) by hand.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: relock
+  cancel-in-progress: false
+
+jobs:
+  relock:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      BRANCH: automation/relock
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: true # needed to push the relock branch below
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: python -m pip install uv
+      - name: Compile lock
+        run: scripts/relock.sh --compile-only
+      - name: Detect changes
+        id: diff
+        run: |
+          if git diff --quiet -- requirements.lock; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "requirements.lock is already up to date."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install dependencies from the new lock
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          python -m pip install \
+            --index-url https://download.pytorch.org/whl/cpu \
+            --no-deps "torch==2.14.0+cpu"
+          python -m pip install -r requirements.lock
+      - name: Run unit tests
+        if: steps.diff.outputs.changed == 'true'
+        shell: bash # bash -e -o pipefail: a failing test run fails the step despite tee
+        run: python -m unittest discover -s tests -v 2>&1 | tee test.log
+      - name: Verify source requirements agree with the lock
+        if: steps.diff.outputs.changed == 'true'
+        run: scripts/relock.sh --check-only
+      - name: Check installed dependencies
+        if: steps.diff.outputs.changed == 'true'
+        run: python -m pip check
+      - name: Open or update pull request
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          tests_summary=$(tail -n 3 test.log | tr '\n' ' ')
+          rm -f test.log
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add requirements.lock
+          git commit -m "chore(deps): relock requirements.lock"
+          # Dedicated bot branch: overwrite it so repeated runs update one PR.
+          git push --force origin "$BRANCH"
+          cat > body.md <<BODY
+          ## Problem
+          Scheduled refresh of \`requirements.lock\`.
+
+          ## Changes
+          \`scripts/relock.sh --compile-only\` regenerated the lock; only that file changed.
+
+          ## Verification
+          Run by the relock workflow against the new lock (Python 3.12):
+          - unit tests: ${tests_summary}
+          - agreement check (\`pip install --dry-run --no-index -r requirements.txt -r requirements.lock\`): passed
+          - \`pip check\`: passed
+
+          ## CI
+          This PR was opened with GITHUB_TOKEN, so the CI workflow does not start automatically (and Python 3.11 is not covered above). Close and reopen the PR to run it.
+
+          ## Risk
+          Transitive dependency versions move; review the diff.
+
+          ## Rollback
+          Close the PR; nothing is merged automatically.
+          BODY
+          if gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number' | grep -q .; then
+            gh pr edit "$BRANCH" --body-file body.md
+          else
+            gh pr create --head "$BRANCH" --base "${{ github.event.repository.default_branch }}" \
+              --title "chore(deps): relock requirements.lock" --body-file body.md
+          fi
