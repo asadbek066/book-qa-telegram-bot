@@ -768,6 +768,71 @@ class TelegramBotBoundaryTests(unittest.TestCase):
         self.assertIn((1, 1), telegram_bot._user_locks)
         self.assertIn((1, 1), telegram_bot._active_user_order)
 
+    def test_stalled_download_does_not_occupy_a_processing_slot(self):
+        download_started = threading.Event()
+        release_download = threading.Event()
+        slots = threading.BoundedSemaphore(1)
+
+        class StalledFile(FakeFile):
+            async def download_to_drive(self, path):
+                download_started.set()
+                await asyncio.to_thread(release_download.wait, 5)
+                await super().download_to_drive(path)
+
+        class StalledBot(FakeBot):
+            async def get_file(self, file_id):
+                del file_id
+                return StalledFile(self.content)
+
+        async def run():
+            with patch.object(telegram_bot, "_book_processing_slots", slots):
+                stalled_update = self.update_for(101, BookDocument("slow.txt"))
+                stalled = asyncio.create_task(
+                    telegram_bot.handle_document(
+                        stalled_update, SimpleNamespace(bot=StalledBot(b"slow"))
+                    )
+                )
+                await asyncio.wait_for(
+                    asyncio.to_thread(download_started.wait), timeout=5
+                )
+                try:
+                    # The only slot must still be free while the download hangs,
+                    # and another session must be able to process a book.
+                    other_update = self.update_for(202, BookDocument("other.txt"))
+                    await telegram_bot.handle_document(
+                        other_update, SimpleNamespace(bot=FakeBot(b"other book"))
+                    )
+                    self.assertIn((202, 202), telegram_bot.user_books)
+                    self.assertTrue(slots.acquire(blocking=False))
+                    slots.release()
+                finally:
+                    release_download.set()
+                await stalled
+                self.assertIn((101, 101), telegram_bot.user_books)
+                self.assertTrue(slots.acquire(blocking=False))
+                slots.release()
+
+        asyncio.run(run())
+
+    def test_busy_slots_after_download_remove_the_temporary_upload(self):
+        slots = threading.BoundedSemaphore(1)
+        self.assertTrue(slots.acquire(blocking=False))
+
+        async def run():
+            with patch.object(telegram_bot, "_book_processing_slots", slots):
+                update = self.update_for(101, BookDocument("book.txt"))
+                await telegram_bot.handle_document(
+                    update, SimpleNamespace(bot=FakeBot(b"book text"))
+                )
+                self.assertIn("busy", update.message.messages[-1].lower())
+
+        asyncio.run(run())
+        self.assertNotIn((101, 101), telegram_bot.user_books)
+        book_root = Path(self.temp_dir.name) / "books"
+        self.assertEqual([p for p in book_root.rglob("*") if p.is_file()], [])
+        embedding_root = Path(self.temp_dir.name) / "embeddings"
+        self.assertEqual([p for p in embedding_root.rglob("*") if p.is_file()], [])
+
     def test_processing_timeout_replies_and_discards_late_result(self):
         started = threading.Event()
         release = threading.Event()

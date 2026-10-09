@@ -674,14 +674,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         processing_slot_reserved = False
 
         try:
-            if not _book_processing_slots.acquire(blocking=False):
-                response = "Book processing is busy. Please try again shortly."
-                if not await _safe_edit(msg, response):
-                    await _safe_reply(update.message, response)
-                return
-            processing_slot_reserved = True
             _ensure_private_directory(file_path.parent)
             _ensure_private_directory(embedding_dir)
+            # The slot is taken only after the download: a slow or stalled
+            # Telegram transfer does no CPU work and must not hold one of the
+            # few global slots. The per-session lock stays held throughout.
             file = await context.bot.get_file(document.file_id)
             await file.download_to_drive(file_path)
 
@@ -696,6 +693,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await _safe_reply(update.message, response)
                 return
             file_path.chmod(0o600)
+
+            if not _book_processing_slots.acquire(blocking=False):
+                response = "Book processing is busy. Please try again shortly."
+                if not await _safe_edit(msg, response):
+                    await _safe_reply(update.message, response)
+                return
+            processing_slot_reserved = True
 
             await _safe_edit(msg, "Processing book...")
             processing_task = _start_reserved_thread_task(
