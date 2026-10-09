@@ -70,6 +70,32 @@ DEFAULT_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 # unavailable offline).
 DEFAULT_EMBEDDING_MODEL_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
 
+
+class BookChunk(str):
+    """A retrieved chunk of text that also knows its PDF page range.
+
+    ``pages`` is ``(first, last)`` using 1-based PDF page positions (not printed
+    page labels), or ``None`` for books without pages (TXT) and for caches
+    written before page data was stored. Being a ``str`` keeps every consumer
+    that treats chunks as plain text working unchanged.
+    """
+
+    pages: tuple[int, int] | None
+
+    def __new__(cls, text: str, pages: tuple[int, int] | None = None):
+        chunk = super().__new__(cls, text)
+        chunk.pages = pages
+        return chunk
+
+
+def format_page_reference(pages: tuple[int, int] | None) -> str:
+    """Return "p. 12" or "pp. 12-13", or "" when there is no page reference."""
+    if pages is None:
+        return ""
+    first, last = pages
+    return f"p. {first}" if first == last else f"pp. {first}-{last}"
+
+
 _MODEL_CACHE: dict[str, SentenceTransformer] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
 
@@ -154,6 +180,9 @@ class BookKnowledgeBase:
         self.model_name = model_name
         self._model = model
         self.documents: list[str] = []
+        # Parallel to ``documents``: (first, last) 1-based PDF page per chunk,
+        # or None when the book has no page data (TXT, or an older cache).
+        self.pages: list[tuple[int, int]] | None = None
         self.embeddings: Any | None = None
         self.book_name: str | None = None
         # Chunking parameters of a restored cache that could not yet be compared
@@ -188,11 +217,19 @@ class BookKnowledgeBase:
         return self._model
 
     def extract_text_from_pdf(self, pdf_path: str | Path) -> str:
+        pages = self.extract_pdf_pages(pdf_path)
+        return "\n".join(pages) if pages else ""
+
+    def extract_pdf_pages(self, pdf_path: str | Path) -> list[str] | None:
+        """Return the text of every PDF page in order (index 0 is page 1).
+
+        Returns None when the PDF is rejected or unreadable.
+        """
         try:
             path = Path(pdf_path)
             if path.stat().st_size > MAX_PDF_FILE_BYTES:
                 logger.warning("PDF rejected: file size limit exceeded")
-                return ""
+                return None
 
             with (
                 pypdf.apply_configuration(
@@ -214,7 +251,7 @@ class BookKnowledgeBase:
                 page_count = len(pdf_reader.pages)
                 if page_count > MAX_PDF_PAGES:
                     logger.warning("PDF rejected: page limit exceeded")
-                    return ""
+                    return None
 
                 text_parts: list[str] = []
                 character_count = 0
@@ -223,31 +260,44 @@ class BookKnowledgeBase:
                     character_count += len(page_text)
                     if character_count > MAX_TEXT_CHARACTERS:
                         logger.warning("PDF rejected: extracted text limit exceeded")
-                        return ""
+                        return None
                     text_parts.append(page_text)
-                return "\n".join(text_parts)
+                return text_parts
         except Exception as exc:  # noqa: BLE001 - malformed PDFs are user input
             logger.error("PDF extraction failed: %s", type(exc).__name__)
-            return ""
+            return None
 
-    def extract_text_from_file(self, file_path: str | Path) -> str:
+    def extract_book(self, file_path: str | Path) -> tuple[str, list[str] | None]:
+        """Return the book text and, for PDFs, the per-page texts (else None).
+
+        This is the single extraction seam: ``load_book`` and
+        ``extract_text_from_file`` both go through it, and PDFs are read only by
+        ``extract_pdf_pages``. Any failure is logged and yields ``("", None)``.
+        """
         path = Path(file_path)
         try:
             if not path.is_file():
-                return ""
+                return "", None
             if path.suffix.lower() == ".pdf":
-                return self.extract_text_from_pdf(path)
+                pages = self.extract_pdf_pages(path)
+                if not pages:
+                    return "", None
+                return "\n".join(pages), pages
             if path.suffix.lower() != ".txt":
-                return ""
+                return "", None
             with path.open("r", encoding="utf-8", errors="replace") as file:
                 text = file.read(MAX_TEXT_CHARACTERS + 1)
             if len(text) > MAX_TEXT_CHARACTERS:
                 logger.warning("Text file rejected: extracted text limit exceeded")
-                return ""
-            return text
+                return "", None
+            return text, None
         except Exception as exc:  # noqa: BLE001 - local files are user input
             logger.error("Book extraction failed: %s", type(exc).__name__)
-            return ""
+            return "", None
+
+    def extract_text_from_file(self, file_path: str | Path) -> str:
+        """Thin wrapper over ``extract_book`` that returns only the text."""
+        return self.extract_book(file_path)[0]
 
     @staticmethod
     def _token_budget(model: Any) -> tuple[int, Any] | None:
@@ -293,18 +343,9 @@ class BookKnowledgeBase:
             "overlap": int(FALLBACK_CHUNK_WORDS * CHUNK_OVERLAP_RATIO),
         }
 
-    def chunk_text(
-        self,
-        text: str,
-        chunk_size: int | None = None,
-        overlap: int | None = None,
-    ) -> list[str]:
-        """Split text into overlapping chunks that fit the embedding model.
-
-        Explicit ``chunk_size``/``overlap`` are word counts. Without them the
-        size is derived from the model (see ``chunking_parameters``).
-        """
-        words = text.split()
+    def _resolve_chunking(
+        self, chunk_size: int | None, overlap: int | None
+    ) -> dict[str, Any]:
         if chunk_size is not None or overlap is not None:
             params = {
                 "unit": "words",
@@ -319,29 +360,88 @@ class BookKnowledgeBase:
             }
         else:
             params = self.chunking_parameters()
-        size, overlap_size = params["chunk_size"], params["overlap"]
-        if size <= 0 or overlap_size < 0 or overlap_size >= size:
+        if (
+            params["chunk_size"] <= 0
+            or params["overlap"] < 0
+            or params["overlap"] >= params["chunk_size"]
+        ):
             raise ValueError("overlap must be smaller than chunk_size")
+        return params
+
+    def chunk_text(
+        self,
+        text: str,
+        chunk_size: int | None = None,
+        overlap: int | None = None,
+    ) -> list[str]:
+        """Split text into overlapping chunks that fit the embedding model.
+
+        Explicit ``chunk_size``/``overlap`` are word counts. Without them the
+        size is derived from the model (see ``chunking_parameters``).
+        """
+        params = self._resolve_chunking(chunk_size, overlap)
+        return [chunk for chunk, _ in self._chunk_words(text.split(), None, params)]
+
+    def chunk_pages(
+        self,
+        pages: list[str],
+        chunk_size: int | None = None,
+        overlap: int | None = None,
+    ) -> tuple[list[str], list[tuple[int, int]]]:
+        """Chunk per-page texts; also return each chunk's (first, last) page.
+
+        Page numbers are 1-based positions in the page list (empty pages keep
+        their position). The chunks are identical to ``chunk_text`` on the pages
+        joined with newlines. Runs in linear time.
+        """
+        params = self._resolve_chunking(chunk_size, overlap)
+        words: list[str] = []
+        word_pages: list[int] = []
+        for page_number, page_text in enumerate(pages, start=1):
+            page_words = page_text.split()
+            words.extend(page_words)
+            word_pages.extend([page_number] * len(page_words))
+        result = self._chunk_words(words, word_pages, params)
+        return (
+            [chunk for chunk, _ in result],
+            [span for _, span in result if span is not None],
+        )
+
+    def _chunk_words(
+        self,
+        words: list[str],
+        word_pages: list[int] | None,
+        params: dict[str, Any],
+    ) -> list[tuple[str, tuple[int, int] | None]]:
+        size, overlap_size = params["chunk_size"], params["overlap"]
+
+        def span(first_word: int, last_word: int) -> tuple[int, int] | None:
+            if word_pages is None:
+                return None
+            return word_pages[first_word], word_pages[last_word]
 
         if params["unit"] == "words":
-            chunks = []
+            chunks: list[tuple[str, tuple[int, int] | None]] = []
             for i in range(0, len(words), size - overlap_size):
-                chunk = " ".join(words[i : i + size])
+                end = min(i + size, len(words))
+                chunk = " ".join(words[i:end])
                 if chunk.strip():
-                    chunks.append(chunk)
+                    chunks.append((chunk, span(i, end - 1)))
             return chunks
 
         tokenizer = self._token_budget(self._get_model())[1]  # type: ignore[index]
-        pieces, counts = self._pieces_with_counts(words, size, tokenizer)
+        pieces, counts, origins = self._pieces_with_counts(words, size, tokenizer)
 
-        chunks = []
+        token_chunks: list[tuple[str, tuple[int, int] | None]] = []
         start = 0
         while start < len(pieces):
             end, used = start, 0
             while end < len(pieces) and (end == start or used + counts[end] <= size):
                 used += counts[end]
                 end += 1
-            chunks.append(" ".join(pieces[start:end]))
+            token_chunks.append(
+                (" ".join(pieces[start:end]), span(origins[start], origins[end - 1]))
+            )
             if end >= len(pieces):
                 break
             # Step back to share about `overlap_size` tokens with the next
@@ -354,7 +454,7 @@ class BookKnowledgeBase:
                 next_start -= 1
                 shared += counts[next_start]
             start = next_start
-        return chunks
+        return token_chunks
 
     @staticmethod
     def _token_counts(tokenizer: Any, texts: list[str]) -> list[int]:
@@ -367,24 +467,36 @@ class BookKnowledgeBase:
     @classmethod
     def _pieces_with_counts(
         cls, words: list[str], budget: int, tokenizer: Any
-    ) -> tuple[list[str], list[int]]:
-        """Split words so each piece fits the budget; return pieces and token counts."""
+    ) -> tuple[list[str], list[int], list[int]]:
+        """Split words so each piece fits the budget.
+
+        Returns the pieces, their token counts and the index of the source word
+        each piece came from.
+        """
         flat: list[str] = []
-        for word in words:
+        flat_origins: list[int] = []
+        for word_index, word in enumerate(words):
             if len(word) > MAX_PIECE_CHARACTERS:
-                flat.extend(
+                parts = [
                     word[i : i + MAX_PIECE_CHARACTERS]
                     for i in range(0, len(word), MAX_PIECE_CHARACTERS)
-                )
+                ]
+                flat.extend(parts)
+                flat_origins.extend([word_index] * len(parts))
             else:
                 flat.append(word)
+                flat_origins.append(word_index)
 
         pieces: list[str] = []
         counts: list[int] = []
+        origins: list[int] = []
         for offset in range(0, len(flat), TOKENIZE_BATCH_WORDS):
             batch = flat[offset : offset + TOKENIZE_BATCH_WORDS]
-            for piece, count in zip(
-                batch, cls._token_counts(tokenizer, batch), strict=True
+            for piece, count, origin in zip(
+                batch,
+                cls._token_counts(tokenizer, batch),
+                flat_origins[offset : offset + TOKENIZE_BATCH_WORDS],
+                strict=True,
             ):
                 if count > budget:
                     # Rare: re-count only the pieces that are too large.
@@ -393,10 +505,12 @@ class BookKnowledgeBase:
                     ):
                         pieces.append(part)
                         counts.append(part_count)
+                        origins.append(origin)
                 else:
                     pieces.append(piece)
                     counts.append(max(1, count))
-        return pieces, counts
+                    origins.append(origin)
+        return pieces, counts, origins
 
     @classmethod
     def _split_to_budget(
@@ -413,24 +527,29 @@ class BookKnowledgeBase:
         ) + cls._split_to_budget(word[middle:], budget, tokenizer)
 
     def load_book(self, file_path: str | Path, book_name: str | None = None) -> bool:
-        text = self.extract_text_from_file(file_path)
+        text, page_texts = self.extract_book(file_path)
         if not text:
             logger.warning("Book contains no extractable text")
             return False
 
         try:
-            documents = self.chunk_text(text)
+            if page_texts is None:
+                documents, pages = self.chunk_text(text), None
+            else:
+                documents, pages = self.chunk_pages(page_texts)
             if not documents or len(documents) > MAX_CHUNKS:
                 logger.warning("Book rejected: chunk limit exceeded or no chunks")
                 return False
 
             embeddings = self._get_model().encode(documents, convert_to_tensor=True)
             self.documents = documents
+            self.pages = pages
             self.embeddings = embeddings
             self._unverified_chunking = None
             self.book_name = book_name or Path(file_path).stem
             if not self.save_embeddings():
                 self.documents = []
+                self.pages = None
                 self.embeddings = None
                 self.book_name = None
                 return False
@@ -438,6 +557,7 @@ class BookKnowledgeBase:
         except Exception as exc:  # noqa: BLE001 - model and storage failures are recoverable
             logger.error("Book processing failed: %s", type(exc).__name__)
             self.documents = []
+            self.pages = None
             self.embeddings = None
             self.book_name = None
             return False
@@ -474,6 +594,26 @@ class BookKnowledgeBase:
         return sum(len(document) for document in documents) <= MAX_TEXT_CHARACTERS
 
     @staticmethod
+    def _pages_are_valid(pages: Any, document_count: int) -> bool:
+        """Page data is optional (None); when present it must match the chunks."""
+        if pages is None:
+            return True
+        if not isinstance(pages, list) or len(pages) != document_count:
+            return False
+        for entry in pages:
+            if (
+                not isinstance(entry, (list, tuple))
+                or len(entry) != 2
+                or not all(
+                    isinstance(number, int) and not isinstance(number, bool)
+                    for number in entry
+                )
+                or not 1 <= entry[0] <= entry[1] <= MAX_PDF_PAGES
+            ):
+                return False
+        return True
+
+    @staticmethod
     def _book_name_is_valid(book_name: Any) -> bool:
         return book_name is None or (
             isinstance(book_name, str)
@@ -487,6 +627,9 @@ class BookKnowledgeBase:
                 raise ValueError("documents are invalid")
             if not self._book_name_is_valid(self.book_name):
                 raise ValueError("book name is invalid")
+
+            if not self._pages_are_valid(self.pages, len(self.documents)):
+                raise ValueError("page data is invalid")
 
             embedding_array = self._embedding_array(self.embeddings)
             if embedding_array.shape[0] != len(self.documents):
@@ -509,6 +652,11 @@ class BookKnowledgeBase:
                         "chunking": self.chunking_parameters(),
                         "embedding_sha256": self._embedding_digest(embedding_array),
                         "documents": self.documents,
+                        "pages": (
+                            None
+                            if self.pages is None
+                            else [list(entry) for entry in self.pages]
+                        ),
                     },
                     handle,
                     ensure_ascii=False,
@@ -561,6 +709,11 @@ class BookKnowledgeBase:
                 return False
             if not self._book_name_is_valid(book_name):
                 return False
+            # Caches written before page citations have no "pages" key; they
+            # stay valid and simply show no page references.
+            raw_pages = payload.get("pages")
+            if not self._pages_are_valid(raw_pages, len(documents)):
+                return False
 
             embedding_array = np.load(self.embeddings_file, allow_pickle=False)
             if (
@@ -589,6 +742,9 @@ class BookKnowledgeBase:
             ):
                 return False
             self.documents = documents
+            self.pages = (
+                None if raw_pages is None else [(int(a), int(b)) for a, b in raw_pages]
+            )
             self.embeddings = torch.as_tensor(embedding_values)
             self.book_name = book_name
             self._unverified_chunking = (
@@ -600,7 +756,9 @@ class BookKnowledgeBase:
             logger.error("Could not load embeddings: %s", type(exc).__name__)
             return False
 
-    def retrieve(self, question: str, top_k: int = 3) -> tuple[list[str], float, Any]:
+    def retrieve(
+        self, question: str, top_k: int = 3
+    ) -> tuple[list[BookChunk], float, Any]:
         """Return the top_k chunks, the best cosine score and the question embedding.
 
         Callers must have checked that a book is loaded and the question is text.
@@ -621,7 +779,14 @@ class BookKnowledgeBase:
         top_score = float(score_array[int(top_results[0])])
         # Log the score only, never the question text.
         logger.debug("Top retrieval similarity: %.4f", top_score)
-        chunks = [self.documents[int(index)] for index in top_results]
+        has_pages = self.pages is not None and len(self.pages) == len(self.documents)
+        chunks = [
+            BookChunk(
+                self.documents[int(index)],
+                self.pages[int(index)] if has_pages else None,  # type: ignore[index]
+            )
+            for index in top_results
+        ]
         return chunks, top_score, question_embedding
 
     def _best_sentences(self, chunk: str, question_embedding: Any) -> str:
@@ -675,6 +840,7 @@ class BookKnowledgeBase:
         if self._unverified_chunking is not None:
             if self._unverified_chunking != self.chunking_parameters(model):
                 self.documents = []
+                self.pages = None
                 self.embeddings = None
                 self.book_name = None
                 self._unverified_chunking = None

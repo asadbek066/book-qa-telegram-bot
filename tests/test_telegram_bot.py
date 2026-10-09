@@ -1097,6 +1097,50 @@ class TelegramBotBoundaryTests(unittest.TestCase):
         self.assertIn("...", captured.output[0])
         self.assertNotIn("x" * 400, captured.output[0])
 
+    def test_page_label_and_excerpt_cap_are_applied_to_long_chunks(self):
+        chunks = [book_qa.BookChunk("word " * 2000, (499, 500)) for _ in range(3)]
+
+        class PagedKnowledgeBase(FakeKnowledgeBase):
+            def answer_question(self, question, top_k, short):
+                del question, top_k, short
+                return "answer", chunks
+
+        telegram_bot.user_books[(101, 101)] = PagedKnowledgeBase("one")
+        telegram_bot.user_books[(101, 101)].documents = ["user one"]
+        update = self.update_for(101, text="Where?")
+
+        asyncio.run(telegram_bot.handle_question(update, SimpleNamespace()))
+
+        response = update.message.messages[-1]
+        full = " ".join(["word"] * 2000)
+        capped = full[: telegram_bot.MAX_SOURCE_EXCERPT_CHARACTERS - 3].rstrip() + "..."
+        lines = response.splitlines()
+        for index in (1, 2, 3):
+            self.assertIn(f"[{index}] pp. 499-500: {capped}", lines)
+        self.assertEqual(len(capped), telegram_bot.MAX_SOURCE_EXCERPT_CHARACTERS)
+
+
+class SourceExcerptPageTests(unittest.TestCase):
+    def test_excerpts_show_single_page_and_page_range(self):
+        chunks = [
+            book_qa.BookChunk("alpha text", (12, 12)),
+            book_qa.BookChunk("beta text", (12, 13)),
+            "gamma text",
+            book_qa.BookChunk("delta text", None),
+        ]
+
+        formatted = telegram_bot._format_source_excerpts(chunks)
+
+        self.assertEqual(
+            formatted.splitlines(),
+            [
+                "[1] p. 12: alpha text",
+                "[2] pp. 12-13: beta text",
+                "[3] gamma text",
+                "[4] delta text",
+            ],
+        )
+
 
 class TelegramBotApplicationBuilderTests(unittest.TestCase):
     def setUp(self):

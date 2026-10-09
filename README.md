@@ -61,8 +61,14 @@ is rejected, so the book has to be uploaded again.
 
 **Answers.** The reply is the sentence of the top chunk that best matches the question,
 followed by the next sentences up to 30 words, then numbered excerpts of the retrieved
-chunks. Excerpts are not PDF page numbers. Scanned PDFs without selectable text will not
-work.
+chunks. For PDFs each excerpt is prefixed with its page, for example `[1] p. 12: ...`, or
+`pp. 12-13` when the chunk spans a page break. A range covers the whole excerpt chunk,
+including the words it shares with the neighbouring chunk. These are 1-based PDF page positions (the
+Nth page of the file), not the page labels printed on the pages, so a book with a
+cover and a preface can differ by an offset. TXT books have no pages and show no page
+reference. Page data is stored in the JSON side of the cache; books saved before this
+feature still load but show no page references until they are uploaded again. Scanned
+PDFs without selectable text will not work.
 
 **Abstaining.** Off by default. With `MIN_SIMILARITY_SCORE=0.0` only negative or NaN
 scores are rejected, so every question gets the best-matching text. A higher value makes

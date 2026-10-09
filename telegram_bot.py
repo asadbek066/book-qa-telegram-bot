@@ -21,7 +21,7 @@ from telegram.ext import (
     filters,
 )
 
-from book_qa import BookKnowledgeBase
+from book_qa import BookKnowledgeBase, format_page_reference
 from file_utils import normalize_book_filename
 
 load_dotenv()
@@ -606,7 +606,9 @@ def _format_source_excerpts(chunks: list[str]) -> str:
         if len(excerpt) > MAX_SOURCE_EXCERPT_CHARACTERS:
             excerpt = excerpt[: MAX_SOURCE_EXCERPT_CHARACTERS - 3].rstrip() + "..."
         if excerpt:
-            excerpts.append(f"[{index}] {excerpt}")
+            page = format_page_reference(getattr(chunk, "pages", None))
+            label = f"{page}: " if page else ""
+            excerpts.append(f"[{index}] {label}{excerpt}")
     return "\n".join(excerpts) or "No source excerpt available"
 
 

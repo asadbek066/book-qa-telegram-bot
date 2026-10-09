@@ -569,13 +569,364 @@ class NotFoundAndSentenceTests(unittest.TestCase):
         self.assertLessEqual(model.encode_calls, 2)
 
 
+def _numbered_pages(page_count, words_per_page, prefix="p"):
+    return [
+        " ".join(f"{prefix}{page}x{n:03d}" for n in range(words_per_page))
+        for page in range(1, page_count + 1)
+    ]
+
+
+class PageCitationTests(unittest.TestCase):
+    def test_chunk_pages_map_chunks_and_overlap_to_page_ranges(self):
+        knowledge_base = BookKnowledgeBase(model=FakeEmbeddingModel())
+        pages = _numbered_pages(3, 5)  # words 0-4, 5-9, 10-14
+
+        chunks, ranges = knowledge_base.chunk_pages(pages, chunk_size=6, overlap=2)
+
+        self.assertEqual(len(chunks), len(ranges))
+        # Chunk 1 is words 0-5 (spans the page 1/2 break), chunk 2 words 4-9
+        # (overlaps chunk 1 by two words), chunk 3 words 8-13, chunk 4 12-14.
+        self.assertEqual(ranges, [(1, 2), (1, 2), (2, 3), (3, 3)])
+        self.assertIn("p1x004", chunks[0].split())
+        self.assertIn("p1x004", chunks[1].split())
+        self.assertEqual(chunks, knowledge_base.chunk_text("\n".join(pages), 6, 2))
+
+    def test_token_unit_chunks_keep_page_ranges_for_split_words(self):
+        model = LimitedEmbeddingModel(max_seq_length=42)
+        knowledge_base = BookKnowledgeBase(model=model)
+        pages = ["a" * 250 + " first", "", "second third"]
+
+        chunks, ranges = knowledge_base.chunk_pages(pages)
+
+        self.assertEqual(len(chunks), len(ranges))
+        self.assertEqual(chunks, knowledge_base.chunk_text("\n".join(pages)))
+        self.assertEqual(ranges[0][0], 1)
+        self.assertEqual(ranges[-1][1], 3)  # empty page 2 still counts as a position
+        for first, last in ranges:
+            self.assertLessEqual(first, last)
+
+    def test_pdf_chunks_carry_one_based_pdf_page_numbers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf = root / "book.pdf"
+            _write_simple_pdf(pdf, _numbered_pages(3, 100))
+            knowledge_base = BookKnowledgeBase(
+                model=FakeEmbeddingModel(), storage_dir=root / "cache"
+            )
+
+            self.assertTrue(knowledge_base.load_book(pdf, "book"))
+
+            # 300 words, 150-word chunks, 15 words overlap.
+            self.assertEqual(knowledge_base.pages, [(1, 2), (2, 3), (3, 3)])
+            _, chunks = knowledge_base.answer_question("anything", top_k=3)
+            self.assertEqual(
+                [chunk.pages for chunk in chunks], [(1, 2), (2, 3), (3, 3)]
+            )
+
+    def test_txt_book_has_no_page_references(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "notes.txt"
+            source.write_text(" ".join(_numbered_pages(1, 400)), encoding="utf-8")
+            knowledge_base = BookKnowledgeBase(
+                model=FakeEmbeddingModel(), storage_dir=root / "cache"
+            )
+
+            self.assertTrue(knowledge_base.load_book(source, "notes"))
+
+            self.assertIsNone(knowledge_base.pages)
+            _, chunks = knowledge_base.answer_question("anything", top_k=2)
+            self.assertTrue(chunks)
+            for chunk in chunks:
+                self.assertIsNone(getattr(chunk, "pages", None))
+
+    def test_cache_round_trip_preserves_pages_in_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf = root / "book.pdf"
+            _write_simple_pdf(pdf, _numbered_pages(3, 100))
+            cache = root / "cache"
+            writer = BookKnowledgeBase(model=FakeEmbeddingModel(), storage_dir=cache)
+            self.assertTrue(writer.load_book(pdf, "book"))
+
+            payload = json.loads((cache / "book_documents.json").read_text())
+            self.assertEqual(payload["pages"], [[1, 2], [2, 3], [3, 3]])
+
+            restored = BookKnowledgeBase(model=FakeEmbeddingModel(), storage_dir=cache)
+            self.assertTrue(restored.load_embeddings())
+            self.assertEqual(restored.pages, [(1, 2), (2, 3), (3, 3)])
+            _, chunks = restored.answer_question("anything", top_k=1)
+            self.assertEqual(chunks[0].pages, (1, 2))
+
+    def test_old_cache_without_page_data_still_loads_without_pages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "notes.txt"
+            source.write_text("alpha beta gamma", encoding="utf-8")
+            cache = root / "cache"
+            writer = BookKnowledgeBase(model=FakeEmbeddingModel(), storage_dir=cache)
+            self.assertTrue(writer.load_book(source, "notes"))
+            payload = json.loads((cache / "book_documents.json").read_text())
+            payload.pop("pages", None)
+            (cache / "book_documents.json").write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+
+            restored = BookKnowledgeBase(model=FakeEmbeddingModel(), storage_dir=cache)
+            self.assertTrue(restored.load_embeddings())
+            self.assertIsNone(restored.pages)
+            answer, chunks = restored.answer_question("alpha")
+            self.assertEqual(chunks, ["alpha beta gamma"])
+            self.assertIsNone(getattr(chunks[0], "pages", None))
+
+    def test_malformed_page_data_is_rejected_not_crashed_on(self):
+        for bad in ([[1, 2]] * 5, "x", [[0, 1]], [[3, 2]], [[True, 1]], [[1]]):
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "notes.txt"
+                source.write_text("alpha beta gamma", encoding="utf-8")
+                cache = root / "cache"
+                writer = BookKnowledgeBase(
+                    model=FakeEmbeddingModel(), storage_dir=cache
+                )
+                self.assertTrue(writer.load_book(source, "notes"))
+                payload = json.loads((cache / "book_documents.json").read_text())
+                payload["pages"] = bad
+                (cache / "book_documents.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+                restored = BookKnowledgeBase(
+                    model=FakeEmbeddingModel(), storage_dir=cache
+                )
+                self.assertFalse(restored.load_embeddings())
+
+    def test_pdf_limits_still_apply_when_collecting_pages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pdf = Path(directory) / "big.pdf"
+            _write_simple_pdf(pdf, ["word"] * 2)
+            knowledge_base = BookKnowledgeBase(model=FakeEmbeddingModel())
+            with patch.object(book_qa, "MAX_TEXT_CHARACTERS", 5):
+                self.assertEqual(knowledge_base.extract_text_from_pdf(pdf), "")
+                self.assertIsNone(knowledge_base.extract_pdf_pages(pdf))
+
+    def test_token_path_page_range_starts_at_the_first_word_of_the_chunk(self):
+        model = LimitedEmbeddingModel(max_seq_length=12, tokenizer=CountingTokenizer())
+        knowledge_base = BookKnowledgeBase(model=model)  # budget 10, overlap 1
+        words = [f"{chr(97 + i // 7)}{i % 7}{chr(120 + i // 7)}" for i in range(21)]
+        pages = [" ".join(words[i : i + 7]) for i in (0, 7, 14)]  # 1 token per word
+
+        chunks, ranges = knowledge_base.chunk_pages(pages)
+
+        # Chunks are words 0-9, 9-18 (one shared word) and 18-20.
+        self.assertEqual(
+            chunks, [" ".join(words[a:b]) for a, b in ((0, 10), (9, 19), (18, 21))]
+        )
+        self.assertEqual(ranges, [(1, 2), (2, 3), (3, 3)])
+
+    def test_pieces_of_a_long_word_keep_the_page_of_that_word(self):
+        model = LimitedEmbeddingModel(max_seq_length=80, tokenizer=CountingTokenizer())
+        knowledge_base = BookKnowledgeBase(model=model)  # budget 78
+        long_one, long_two = "x" * 250, "y" * 250  # three 100/100/50-char pieces
+        pages = [f"aaa {long_one}", f"{long_two} bbb"]
+
+        chunks, ranges = knowledge_base.chunk_pages(pages)
+
+        self.assertEqual(
+            chunks,
+            [
+                f"aaa {'x' * 100} {'x' * 100}",
+                f"{'x' * 50} {'y' * 100}",
+                f"{'y' * 100} {'y' * 50} bbb",
+            ],
+        )
+        self.assertEqual(ranges, [(1, 1), (1, 2), (2, 2)])
+
+    def test_oversize_pieces_split_to_the_budget_keep_the_page_of_their_word(self):
+        model = LimitedEmbeddingModel(max_seq_length=12, tokenizer=CountingTokenizer())
+        knowledge_base = BookKnowledgeBase(model=model)  # budget 10, 50 chars = 17
+        pages = [f"aaa {'x' * 50}", f"{'y' * 50} bbb"]
+
+        chunks, ranges = knowledge_base.chunk_pages(pages)
+
+        self.assertEqual(
+            chunks,
+            [
+                f"aaa {'x' * 25}",
+                "x" * 25,
+                "y" * 25,
+                f"{'y' * 25} bbb",
+            ],
+        )
+        self.assertEqual(ranges, [(1, 1), (1, 1), (2, 2), (2, 2)])
+
+    def test_page_numbers_beyond_the_page_limit_are_rejected_in_the_cache(self):
+        for bad in ([[1, 501]], [[1, 10**30]], [[501, 501]]):
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "notes.txt"
+                source.write_text("alpha beta gamma", encoding="utf-8")
+                cache = root / "cache"
+                writer = BookKnowledgeBase(
+                    model=FakeEmbeddingModel(), storage_dir=cache
+                )
+                self.assertTrue(writer.load_book(source, "notes"))
+                payload = json.loads((cache / "book_documents.json").read_text())
+                payload["pages"] = bad
+                (cache / "book_documents.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+                restored = BookKnowledgeBase(
+                    model=FakeEmbeddingModel(), storage_dir=cache
+                )
+                self.assertFalse(restored.load_embeddings())
+                self.assertIsNone(restored.pages)
+
+    def _loaded_pdf_knowledge_base(self, root, **kwargs):
+        pdf = root / "book.pdf"
+        _write_simple_pdf(pdf, _numbered_pages(3, 100))
+        knowledge_base = BookKnowledgeBase(
+            model=kwargs.pop("model", FakeEmbeddingModel()),
+            storage_dir=root / "cache",
+        )
+        self.assertTrue(knowledge_base.load_book(pdf, "book"))
+        self.assertIsNotNone(knowledge_base.pages)
+        return knowledge_base
+
+    def test_loading_a_txt_after_a_pdf_leaves_no_page_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            knowledge_base = self._loaded_pdf_knowledge_base(root)
+            source = root / "notes.txt"
+            source.write_text("alpha beta gamma", encoding="utf-8")
+
+            self.assertTrue(knowledge_base.load_book(source, "notes"))
+
+            self.assertIsNone(knowledge_base.pages)
+            _, chunks = knowledge_base.answer_question("alpha")
+            self.assertIsNone(getattr(chunks[0], "pages", None))
+
+    def test_failed_loads_clear_page_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            knowledge_base = self._loaded_pdf_knowledge_base(root)
+            other = root / "other.pdf"
+            _write_simple_pdf(other, _numbered_pages(2, 10, prefix="q"))
+
+            with patch.object(knowledge_base, "save_embeddings", return_value=False):
+                self.assertFalse(knowledge_base.load_book(other, "other"))
+            self.assertIsNone(knowledge_base.pages)
+            self.assertEqual(knowledge_base.documents, [])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            knowledge_base = self._loaded_pdf_knowledge_base(root)
+            other = root / "other.pdf"
+            _write_simple_pdf(other, _numbered_pages(2, 10, prefix="q"))
+
+            with patch.object(
+                knowledge_base._get_model(), "encode", side_effect=RuntimeError("boom")
+            ):
+                self.assertFalse(knowledge_base.load_book(other, "other"))
+            self.assertIsNone(knowledge_base.pages)
+            self.assertEqual(knowledge_base.documents, [])
+
+    def test_stale_cache_invalidation_clears_page_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._loaded_pdf_knowledge_base(root, model=LimitedEmbeddingModel(42))
+
+            book_qa._MODEL_CACHE.clear()
+            restored = BookKnowledgeBase(storage_dir=root / "cache")
+            self.assertTrue(restored.load_embeddings())
+            self.assertIsNotNone(restored.pages)
+            restored._model = LimitedEmbeddingModel(130)  # different limit
+
+            answer, chunks = restored.answer_question("p1x001")
+
+            self.assertEqual((answer, chunks), (book_qa.STALE_CACHE_MESSAGE, []))
+            self.assertIsNone(restored.pages)
+
+    def test_load_book_reads_pdfs_only_through_extract_pdf_pages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf = root / "book.pdf"
+            pdf.write_bytes(b"not read: extract_pdf_pages is replaced")
+            knowledge_base = BookKnowledgeBase(
+                model=FakeEmbeddingModel(), storage_dir=root / "cache"
+            )
+
+            def forbidden(*_args, **_kwargs):
+                raise AssertionError("load_book must not use this entry point")
+
+            knowledge_base.extract_text_from_pdf = forbidden
+            knowledge_base.extract_text_from_file = forbidden
+            with patch.object(
+                knowledge_base,
+                "extract_pdf_pages",
+                return_value=["alpha beta", "gamma delta"],
+            ) as seam:
+                self.assertTrue(knowledge_base.load_book(pdf, "book"))
+
+            seam.assert_called_once_with(pdf)
+            self.assertEqual(knowledge_base.documents, ["alpha beta gamma delta"])
+            self.assertEqual(knowledge_base.pages, [(1, 2)])
+
+    def test_text_entry_points_are_wrappers_over_the_page_reader(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pdf = Path(directory) / "book.PDF"
+            pdf.write_bytes(b"unused")
+            knowledge_base = BookKnowledgeBase(model=FakeEmbeddingModel())
+            with patch.object(
+                knowledge_base, "extract_pdf_pages", return_value=["one", "two"]
+            ):
+                self.assertEqual(knowledge_base.extract_text_from_file(pdf), "one\ntwo")
+                self.assertEqual(knowledge_base.extract_text_from_pdf(pdf), "one\ntwo")
+
+    def test_load_book_returns_false_when_the_path_cannot_be_inspected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            knowledge_base = BookKnowledgeBase(
+                model=FakeEmbeddingModel(), storage_dir=root / "cache"
+            )
+            for name in ("book.pdf", "book.txt"):
+                with (
+                    self.subTest(name=name),
+                    patch.object(
+                        Path, "is_file", side_effect=PermissionError("denied")
+                    ),
+                    self.assertLogs("book_qa", level="ERROR") as logs,
+                ):
+                    self.assertFalse(knowledge_base.load_book(root / name))
+                    self.assertIn("Book extraction failed", logs.output[0])
+
+    def test_load_book_returns_false_for_a_file_in_an_unreadable_directory(self):
+        if os.geteuid() == 0:
+            self.skipTest("root bypasses directory permissions")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            locked = root / "locked"
+            locked.mkdir()
+            (locked / "book.pdf").write_bytes(b"x")
+            locked.chmod(0)
+            try:
+                knowledge_base = BookKnowledgeBase(
+                    model=FakeEmbeddingModel(), storage_dir=root / "cache"
+                )
+                with self.assertLogs("book_qa", level="ERROR"):
+                    self.assertFalse(knowledge_base.load_book(locked / "book.pdf"))
+            finally:
+                locked.chmod(0o700)
+
+
 class BookKnowledgeBaseTests(unittest.TestCase):
     def test_uppercase_pdf_extension_uses_pdf_extractor(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "book.PDF"
             path.write_bytes(b"not a real pdf")
             knowledge_base = BookKnowledgeBase(model=FakeEmbeddingModel())
-            knowledge_base.extract_text_from_pdf = lambda _: "extracted pdf text"
+            # extract_pdf_pages is the one PDF reader; the text entry points
+            # are wrappers over it (see test_load_book_reads_pdfs_only_through...).
+            knowledge_base.extract_pdf_pages = lambda _: ["extracted pdf text"]
 
             self.assertEqual(
                 knowledge_base.extract_text_from_file(path), "extracted pdf text"
