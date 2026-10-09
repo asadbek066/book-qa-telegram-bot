@@ -88,8 +88,8 @@ jobs:
         run: |
           tests_summary=$(tail -n 3 test.log | tr '\n' ' ')
           rm -f test.log
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "Asadbek Bobojonov"
+          git config user.email "121876874+asadbek066@users.noreply.github.com"
           git checkout -b "$BRANCH"
           git add requirements.lock
           git commit -m "chore(deps): relock requirements.lock"
